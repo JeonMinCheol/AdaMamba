@@ -62,7 +62,7 @@ class MoETSAEncoderLayer(nn.Module):
     def __init__(self, d_model, d_ff, dropout=0.1):
         super().__init__()
         self.tsa = ContextualTSA(d_model, dropout=dropout)
-        self.moe_ffn = FFN(d_model, d_ff, dropout)
+        self.ffn = FFN(d_model, d_ff, dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -72,7 +72,7 @@ class MoETSAEncoderLayer(nn.Module):
         src = norm_src + src2
 
         norm_src = self.norm2(src)
-        src2 = self.moe_ffn(norm_src)
+        src2 = self.ffn(norm_src)
         src = norm_src + src2 
 
         return src
