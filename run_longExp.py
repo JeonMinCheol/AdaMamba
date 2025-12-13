@@ -45,15 +45,10 @@ if __name__ == '__main__':
     #parser.add_argument('--individual', action='store_true', default=False, help='DLinear: a linear layer for each variate(channel) individually')
 
     # AdaMamba
-    parser.add_argument('--num_experts', type=int, default=8)
-    parser.add_argument('--tau', type=float, default=2.0)
     parser.add_argument('--d_head', type=int, default=2048)
-    parser.add_argument('--moe_output_dropout', type=float, default=0.1)
-    parser.add_argument('--moe_expert_dropout', type=float, default=0.1)
     parser.add_argument('--reduction_ratio', type=int, default=4)
     parser.add_argument('--lambda_h_loss', type=float, default=1)
     parser.add_argument('--lambda_q_loss', type=float, default=1)
-    parser.add_argument('--lambda_d_loss', type=float, default=1)
 
     # PatchTST
     parser.add_argument('--fc_dropout', type=float, default=0.05, help='fully connected dropout')
@@ -167,26 +162,22 @@ if __name__ == '__main__':
     if args.is_training:
         for ii in range(args.itr):
             if args.model == "AdaMamba":
-                setting = 'seed{}_{}_{}_{}_{}_{}_mod{}_med{}_hdrop{}_drop{}_tau{}_rr{}_hl{}_ql{}_dl{}_lr{}'.format(
+                setting = 'seed{}_{}_{}_{}_{}_{}_head_drop{}_drop{}_rr{}_hl{}_ql{}_lr{}'.format(
                 args.random_seed,
                 args.model,
                 args.model_id,
                 args.d_model,
                 args.d_ff,
                 args.d_head,
-                args.moe_output_dropout,
-                args.moe_expert_dropout,
                 args.head_dropout,
                 args.dropout,
-                args.tau,
                 args.reduction_ratio,
                 args.lambda_h_loss,
                 args.lambda_q_loss,
-                args.lambda_d_loss,
                 args.learning_rate
                 )
             else:
-                setting = 'seed{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt_{}'.format(
+                setting = 'seed{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_dff{}_fc{}_eb{}_dt_{}_{}_{}'.format(
                     args.random_seed,
                     args.model,
                     args.model_id,
@@ -203,8 +194,9 @@ if __name__ == '__main__':
                     args.factor,
                     args.embed,
                     args.distil,
-                    args.des,
-                    ii)
+                    args.learning_rate,
+                    args.dropout
+                    )
 
             exp = Exp(args)  # set experiments
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
@@ -219,46 +211,43 @@ if __name__ == '__main__':
 
             torch.cuda.empty_cache()
     else:
-        ii = 0
         if args.model == "AdaMamba":
-            setting = 'seed{}_{}_{}_{}_{}_{}_mod{}_med{}_hdrop{}_drop{}_tau{}_rr{}_hl{}_ql{}_dl{}_lr{}'.format(
+            if args.model == "AdaMamba":
+                setting = 'seed{}_{}_{}_{}_{}_{}_head_drop{}_drop{}_rr{}_hl{}_ql{}_lr{}'.format(
                 args.random_seed,
                 args.model,
                 args.model_id,
                 args.d_model,
                 args.d_ff,
                 args.d_head,
-                args.moe_output_dropout,
-                args.moe_expert_dropout,
                 args.head_dropout,
                 args.dropout,
-                args.tau,
                 args.reduction_ratio,
                 args.lambda_h_loss,
                 args.lambda_q_loss,
-                args.lambda_d_loss,
                 args.learning_rate
                 )
         else:
-            setting = 'seed{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_df{}_fc{}_eb{}_dt_{}'.format(
-                args.random_seed,
-                args.model,
-                args.model_id,
-                args.data,
-                args.features,
-                args.seq_len,
-                args.label_len,
-                args.pred_len,
-                args.d_model,
-                args.n_heads,
-                args.e_layers,
-                args.d_layers,
-                args.d_ff,
-                args.factor,
-                args.embed,
-                args.distil,
-                args.des,
-                ii)
+            setting = 'seed{}_{}_{}_{}_ft{}_sl{}_ll{}_pl{}_dm{}_nh{}_el{}_dl{}_dff{}_fc{}_eb{}_dt_{}_{}_{}'.format(
+                    args.random_seed,
+                    args.model,
+                    args.model_id,
+                    args.data,
+                    args.features,
+                    args.seq_len,
+                    args.label_len,
+                    args.pred_len,
+                    args.d_model,
+                    args.n_heads,
+                    args.e_layers,
+                    args.d_layers,
+                    args.d_ff,
+                    args.factor,
+                    args.embed,
+                    args.distil,
+                    args.learning_rate,
+                    args.dropout
+                    )
 
         exp = Exp(args)  # set experiments
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))

@@ -82,20 +82,6 @@ def energy_score(y_true: torch.Tensor, y_samples: torch.Tensor) -> torch.Tensor:
     return term1 - term2
 
 
-def directional_loss(y_pred, y_true):
-    # y_pred, y_true shape: [B, L, C]
-
-    # 연속된 시점 간의 차이를 계산 (부호가 방향을 의미)
-    pred_diff = y_pred[:, 1:, :] - y_pred[:, :-1, :]
-    true_diff = y_true[:, 1:, :] - y_true[:, :-1, :]
-
-    # 두 방향 벡터의 코사인 유사도를 손실로 사용 (유사하면 1, 반대면 -1)
-    # 1에서 빼서 손실로 만듦 (반대 방향일수록 손실이 커짐)
-    loss = 1 - F.cosine_similarity(pred_diff, true_diff, dim=1)
-
-    return loss.mean()
-
-
 def spectral_loss(y_pred, y_true):
     # y_pred, y_true shape: [B, L, C]
 

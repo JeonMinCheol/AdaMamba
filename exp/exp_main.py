@@ -303,6 +303,7 @@ class Exp_Main(Exp_Basic):
                 deter_train_loss = np.average(deter_train_loss)
 
             epoch_end_time = time.time()
+            
             vali_loss, vali_mae, vali_mse, vali_rmse, vali_mape, vali_mspe, vali_rse, _ = self.vali(vali_loader, criterion, epoch, "val")
             test_loss, test_mae, test_mse, test_rmse, test_mape, test_mspe, test_rse, _ = self.vali(test_loader, criterion, epoch, "test")
 

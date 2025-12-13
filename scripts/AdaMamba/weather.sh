@@ -18,25 +18,21 @@ if [ ! -d "./logs/LongForecasting" ]; then
     mkdir ./logs/LongForecasting
 fi
 
-root_path_name=/local_datasets/a2019102224/timeseries/all_six_datasets/
-seq_len=336
-model_name=TSF_TSM
-d_model=128
-d_ff=128
-n_heads=16
-features=M
-e_layers=3
-hidden_features=128
-pred_len=336
+main_path=/data/a2019102224/AdaMamba/run_longExp.py
+root_path_name=/local_datasets/a2019102224/timeseries_dataset/
+model_name=AdaMamba
+
 random_seed=2021
-flow_layers=4
-num_bins=8
+n_heads=4
+features=M
+seq_len=336
+pred_len=336
+nodes=4
 
 data_path_name=weather.csv
 model_id_name=weather
 data_name=custom
-
-torchrun --nproc_per_node=4 /data/a2019102224/PatchTST_supervised/run_longExp.py \
+torchrun --nproc_per_node=$nodes $main_path \
       --random_seed $random_seed \
       --is_training 1 \
       --root_path $root_path_name \
@@ -44,26 +40,20 @@ torchrun --nproc_per_node=4 /data/a2019102224/PatchTST_supervised/run_longExp.py
       --model_id $model_id_name'_'$seq_len'_'$pred_len \
       --model $model_name \
       --data $data_name \
-      --features M \
       --seq_len $seq_len \
       --pred_len $pred_len \
-      --enc_in 21 \
-      --e_layers 3 \
-      --n_heads $n_heads \
-      --d_model $d_model \
-      --d_ff $d_ff \
-      --flow_layers $flow_layers \
-      --num_bins $num_bins \
-      --c_out 21 \
-      --hidden_features $hidden_features \
-      --dropout 0.2\
-      --patch_len 24\
-      --stride 12\
-      --des 'Exp' \
-      --train_epochs 100\
-      --alpha 0.01\
-      --num_experts 6 \
-      --use_multi_gpu \
-      --devices '0,1,2,3' \
-      --itr 1 --batch_size 512 --learning_rate 0.0001  >logs/LongForecasting/$model_name'_'$model_id_name'_'$seq_len'_'$pred_len.log 
+      --features M \
+      --enc_in 1 \
+      --n_heads 2 \
+      --dropout 0.3 \
+      --patch_len 48 \
+      --stride 48 \
+      --lambda_h_loss 1 \
+      --lambda_q_loss 1 \
+      --d_ff 256 \
+      --d_head 512 \
+      --d_model 64 \
+      --batch_size 128 \
+      --learning_rate 0.00002 \
+      --reduction_ratio 6 >logs/LongForecasting/$model_name'_'$model_id_name'_'$seq_len'_'$pred_len.log 
 done
