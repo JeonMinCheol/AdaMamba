@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import math
 from .Normalizing_Flows import create_conditional_nsf_flow
     
-class MeanPredictionHead(nn.Module):
+class PredictionHead(nn.Module):
     def __init__(self, configs):
         super().__init__()
         self.pred_len = configs.pred_len

@@ -26,7 +26,7 @@ class Model(nn.Module):
         
         self.adaptive_norm_block = AdaptiveNormalizationBlock(configs)
         self.encoder = ContextEncoder(configs)
-        self.mean_head = MeanPredictionHead(configs)
+        self.mean_head = PredictionHead(configs)
         self.trend_gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, x_enc, batch_y):
