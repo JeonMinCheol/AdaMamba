@@ -56,49 +56,6 @@ def quantile_loss(y_pred, y_true, q):
     return torch.max((q-1)*e, q*e).mean()
 
 
-def energy_score(y_true: torch.Tensor, y_samples: torch.Tensor) -> torch.Tensor:
-    """
-    Differentiable Energy Score (for training with NF samples).
-
-    Args:
-        y_true: (B, L, C) ground truth
-        y_samples: (S, B, L, C) samples from NF (differentiable via reparam)
-
-    Returns:
-        scalar loss
-    """
-    S, B, L, C = y_samples.shape
-    y_true = y_true.unsqueeze(0).expand(S, -1, -1, -1)  # (S, B, L, C)
-
-    # Term1: E ||X - y||
-    term1 = torch.linalg.norm(y_samples - y_true, dim=-1).mean()
-
-    # Term2: 0.5 * E ||X - X'||
-    # reshape to (S*B, L*C) for efficiency
-    flat_samples = y_samples.reshape(S * B, -1)
-    pw = torch.cdist(flat_samples, flat_samples, p=2)  # (S*B, S*B)
-    term2 = 0.5 * pw.mean()
-
-    return term1 - term2
-
-
-def spectral_loss(y_pred, y_true):
-    # y_pred, y_true shape: [B, L, C]
-
-    # FFT를 위해 채널 차원을 뒤로 보냄
-    pred_transposed = y_pred.permute(0, 2, 1)
-    true_transposed = y_true.permute(0, 2, 1)
-
-    # FFT 적용
-    pred_fft = torch.fft.rfft(pred_transposed, dim=-1)
-    true_fft = torch.fft.rfft(true_transposed, dim=-1)
-
-    # 스펙트럼의 크기(magnitude)에 대한 L1 손실 계산
-    magnitude_loss = F.l1_loss(torch.abs(pred_fft), torch.abs(true_fft))
-
-    return magnitude_loss
-
-
 def metric(pred, true):
     mae = MAE(pred, true)
     mse = MSE(pred, true)

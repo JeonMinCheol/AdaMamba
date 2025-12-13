@@ -1,10 +1,9 @@
 from ast import mod
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
-from models import AdaMamba, Informer, Autoformer, Transformer, DLinear, Linear, NLinear, PatchTST, iTransformer, ModernTCN
+from models import AdaMamba, Informer, Autoformer, Transformer, DLinear, Linear, NLinear, PatchTST, iTransformer, ModernTCN, FEDformer
 from utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop, plot_attention_heatmap, get_heatmap_image_tensor, log_layer_stats
-from utils.metrics import metric, energy_score
-from utils.masking import random_segment_mask
+from utils.metrics import metric
 from tqdm import tqdm
 from datetime import timedelta
 
@@ -64,6 +63,7 @@ class Exp_Main(Exp_Basic):
 
         # --- 모델 생성 ---
         model_dict = {
+            'FEDformer': FEDformer,
             'Autoformer': Autoformer,
             'Transformer': Transformer,
             'iTransformer': iTransformer,
