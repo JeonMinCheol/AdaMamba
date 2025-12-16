@@ -1,8 +1,8 @@
 from ast import mod
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
-from models import AdaMamba, Informer, Autoformer, Transformer, DLinear, Linear, NLinear, PatchTST, iTransformer, ModernTCN, FEDformer
-from utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop, plot_attention_heatmap, get_heatmap_image_tensor, log_layer_stats
+from models import AdaMamba, Informer, Autoformer, Transformer, DLinear, Linear, NLinear, PatchTST, iTransformer, ModernTCN, FEDformer, TimeMixer
+from utils.tools import EarlyStopping, adjust_learning_rate, visual, test_params_flop
 from utils.metrics import metric
 from tqdm import tqdm
 from datetime import timedelta
@@ -14,18 +14,11 @@ from torch import optim
 from torch.optim import lr_scheduler 
 import torch.distributed as dist
 
-import random
 import os
 import time
 
 import warnings
-import matplotlib.pyplot as plt
 
-import logging
-
-from torch.utils.tensorboard import SummaryWriter
-
-from torch.profiler import profile, record_function, ProfilerActivity
 torch.backends.cudnn.deterministic=True
 warnings.filterwarnings('ignore')
 
@@ -53,14 +46,6 @@ class Exp_Main(Exp_Basic):
             self.device = torch.device("cuda" if self.args.use_gpu else "cpu")
             self.rank = 0
 
-        # rank 0만 로그 작성
-        if self.rank == 0:
-            log_dir = f"/data/a2019102224/PatchTST_supervised/tensor_logs/{self.args.model_id}_{self.args.model}/"
-            os.makedirs(log_dir, exist_ok=True)
-            self.writer = SummaryWriter(log_dir)
-            self.writer.add_scalar("scalar/stride", self.args.stride)
-            self.writer.add_scalar("scalar/window_size", self.args.patch_len)
-
         # --- 모델 생성 ---
         model_dict = {
             'FEDformer': FEDformer,
@@ -72,8 +57,9 @@ class Exp_Main(Exp_Basic):
             'NLinear': NLinear,
             'Linear': Linear,
             'PatchTST': PatchTST,
-            'AdaMamba': AdaMamba,
             'ModernTCN': ModernTCN,
+            'TimeMixer': TimeMixer,
+            'AdaMamba': AdaMamba,
         }
         model = model_dict[self.args.model].Model(self.args).float()
 
@@ -129,7 +115,7 @@ class Exp_Main(Exp_Basic):
                 # encoder - decoder
                 if self.args.model == "AdaMamba":
                     if self.args.use_amp:
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast():
                             outputs = self.model.sample(batch_x)
                             predictions_on_cpu.append(outputs.detach().cpu())
                             stacked_predictions = torch.stack(predictions_on_cpu, dim=0)
@@ -142,7 +128,7 @@ class Exp_Main(Exp_Basic):
 
                 else:
                     if self.args.use_amp:
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast():
                             if 'Linear' in self.args.model or 'TST' in self.args.model:
                                 outputs = self.model(batch_x)
                             elif 'TCN' in self.args.model:
@@ -204,7 +190,7 @@ class Exp_Main(Exp_Basic):
         criterion = self._select_criterion()
 
         if self.args.use_amp:
-            scaler = torch.cuda.amp.GradScaler()
+            scaler = torch.amp.GradScaler()
         
         scheduler = lr_scheduler.OneCycleLR(optimizer = model_optim,
                                         steps_per_epoch = train_steps,
@@ -217,7 +203,6 @@ class Exp_Main(Exp_Basic):
             iter_count = 0
 
             sampler.set_epoch(epoch) if sampler is not None else None
-            log_layer_stats(self.writer, self.model, epoch * train_steps, model_optim) if self.rank == 0 else None
             epoch_start_time = time.time()
 
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(tqdm(train_loader, desc=f"Train Epoch {epoch}")):
@@ -235,7 +220,7 @@ class Exp_Main(Exp_Basic):
                 # encoder - decoder
                 if self.args.model != "AdaMamba":
                     if self.args.use_amp:
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast():
                             if 'Linear' in self.args.model or 'TST' in self.args.model:
                                 outputs = self.model(batch_x, batch_y)
                             elif 'TCN' in self.args.model:
@@ -279,7 +264,7 @@ class Exp_Main(Exp_Basic):
 
                 else:
                     if self.args.use_amp:
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast():
                             # 모델 forward 한 번 호출
                             total_loss = self.model(batch_x, batch_y)
                             scaler.scale(total_loss).backward()
@@ -308,29 +293,7 @@ class Exp_Main(Exp_Basic):
             test_loss, test_mae, test_mse, test_rmse, test_mape, test_mspe, test_rse, _ = self.vali(test_loader, criterion, epoch, "test")
 
             if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
-                self.writer.add_scalar("vali/loss", vali_loss, epoch)
-                self.writer.add_scalar("vali/mae", vali_mae, epoch)
-                self.writer.add_scalar("vali/mse", vali_mse, epoch)
-                self.writer.add_scalar("vali/rmse", vali_rmse, epoch)
-                self.writer.add_scalar("vali/mape", vali_mape, epoch)
-                self.writer.add_scalar("vali/mspe", vali_mspe, epoch)
-                self.writer.add_scalar("vali/rse", vali_rse, epoch)
-                
-                self.writer.add_scalar("test/loss", test_loss, epoch)
-                self.writer.add_scalar("test/mae", test_mae, epoch)
-                self.writer.add_scalar("test/mse", test_mse, epoch)
-                self.writer.add_scalar("test/rmse", test_rmse, epoch)
-                self.writer.add_scalar("test/mape", test_mape, epoch)
-                self.writer.add_scalar("test/mspe", test_mspe, epoch)
-                self.writer.add_scalar("test/rse", test_rse, epoch)
-
-                self.writer.flush()
-            if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
-                print("[RANK {}] Epoch: {} cost time: {:.2f}".format(self.rank, epoch + 1, epoch_end_time - epoch_start_time), end=" ")
-                a = "| Train: {:.6f}, Val: {:.6f}, Test: {:.6f}".format(train_loss, vali_loss, test_loss)
-                if self.args.model == "AdaMamba":
-                    a = "| Loss: {:.6f} Train: {:.6f}, Val: {:.6f}, Test: {:.6f}".format(total_loss, train_loss, vali_loss, test_loss)
-                print(a)
+                print("[RANK {}] Epoch: {} cost time: {:.2f} | Train: {:.6f}, Val: {:.6f}, Test: {:.6f}".format(self.rank, epoch + 1, epoch_end_time - epoch_start_time, train_loss, vali_loss, test_loss))
 
             early_stopping(vali_loss, test_loss, self.model, path)
             if early_stopping.early_stop: 
@@ -384,14 +347,14 @@ class Exp_Main(Exp_Basic):
                 # encoder - decoder
                 if self.args.model == "AdaMamba":
                     if self.args.use_amp:
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast():
                             outputs = self.model.sample(batch_x)
                     else:
                         outputs = self.model.sample(batch_x)
 
                 else:
                     if self.args.use_amp:
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast():
                             if 'Linear' in self.args.model or 'TST' in self.args.model:
                                 outputs = self.model(batch_x)
                             elif 'TCN' in self.args.model:
@@ -444,22 +407,18 @@ class Exp_Main(Exp_Basic):
         inputx = inputx.reshape(-1, inputx.shape[-2], inputx.shape[-1])
 
         # result save
-        # folder_path = './results/' + setting + '/'
-        # os.makedirs(folder_path, exist_ok=True)
         if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
-            # np.save(folder_path + 'pred.npy', preds)
-            mae, mse, rmse, mape, mspe, rse, corr = metric(preds, trues)
+            mae, mse, rmse, mape, mspe, rse, _ = metric(preds, trues)
             print('mae:{}, mse:{}, rmse:{}, mape:{}, mspe:{}, rse:{}'.format(mae, mse, rmse, mape, mspe, rse))
             f = open("result.txt", 'a')
-            f.write(setting + "  \n")
-            f.write('mae:{}, mse:{}, rmse:{}, mape:{}, mspe:{}, rse:{}'.format(mae, mse, rmse, mape, mspe, rse))
-            f.write('\n')
-            f.write('\n')
+            f.write(setting + "\n")
+            f.write('mae:{}, mse:{}, rmse:{}, mape:{}, mspe:{}, rse:{}\n\n'.format(mae, mse, rmse, mape, mspe, rse))
             f.close()
 
             self.writer.close()
 
-        if (self.args.use_multi_gpu): dist.destroy_process_group()
+        if (self.args.use_multi_gpu): 
+            dist.destroy_process_group()
 
         return
 
@@ -488,14 +447,14 @@ class Exp_Main(Exp_Basic):
                 # encoder - decoder
                 if self.args.model == "AdaMamba":
                     if self.args.use_amp:
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast():
                             outputs = self.model.sample(batch_x)
                     else:
                         outputs = self.model.sample(batch_x)
                         
                 else:
                     if self.args.use_amp:
-                        with torch.cuda.amp.autocast():
+                        with torch.amp.autocast():
                             if 'Linear' in self.args.model or 'TST' in self.args.model:
                                 outputs = self.model(batch_x)
                             elif 'TCN' in self.args.model:
@@ -515,7 +474,7 @@ class Exp_Main(Exp_Basic):
                                 outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                             else:
                                 outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                pred = outputs.detach().cpu().numpy()  # .squeeze()
+                pred = outputs.detach().cpu().numpy()  
                 preds.append(pred)
 
         preds = np.array(preds)

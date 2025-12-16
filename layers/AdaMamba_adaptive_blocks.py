@@ -20,19 +20,18 @@ class SEBlock(nn.Module):
         return x * y.expand_as(x) # Scale (Re-calibrate)
 
 class MultiScaleTrendSE(nn.Module): # kernel size = pibonacci [3,5,8,13,21,34,55,89]
-    def __init__(self, enc_in, seq_len, pred_len, dropout, kernel_sizes=[3,5,8,13,21,34,55,89], reduction_ratio=4):
+    def __init__(self, seq_len, pred_len, dropout, kernel_sizes=[3,5,8,13,21,34,55,89], reduction_ratio=4):
         super().__init__()
-        self.enc_in = enc_in
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.kernel_sizes = kernel_sizes
         self.trend_convs = nn.ModuleList([
-            nn.Conv1d(in_channels=self.enc_in, out_channels=self.enc_in, kernel_size=k, padding='same')
+            nn.Conv1d(in_channels=1, out_channels=1, kernel_size=k, padding='same')
             for k in kernel_sizes
         ])
-        num_combined_channels = self.enc_in * len(kernel_sizes)
+        num_combined_channels = len(kernel_sizes)
         self.se_block = SEBlock(num_combined_channels, reduction_ratio=reduction_ratio)
-        self.projection = nn.Linear(num_combined_channels, self.enc_in)
+        self.projection = nn.Linear(num_combined_channels, 1)
         self.projection_dropout = nn.Dropout(dropout) 
 
     def forward(self, x):
@@ -52,7 +51,7 @@ class MultiScaleTrendSE(nn.Module): # kernel size = pibonacci [3,5,8,13,21,34,55
 class AdaptiveNormalizationBlock(nn.Module):
     def __init__(self, configs):
         super().__init__()
-        self.detrender_context_generator = MultiScaleTrendSE(configs.enc_in, configs.seq_len, configs.pred_len, configs.dropout, reduction_ratio=configs.reduction_ratio)
+        self.detrender_context_generator = MultiScaleTrendSE(configs.seq_len, configs.pred_len, configs.dropout, reduction_ratio=configs.reduction_ratio)
         
     def normalize(self, x):
         # x shape: [B, L, C]

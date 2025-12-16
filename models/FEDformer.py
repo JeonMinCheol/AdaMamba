@@ -62,12 +62,12 @@ class Model(nn.Module):
                                             mode_select_method=configs.mode_select)
             decoder_self_att = FourierBlock(in_channels=configs.d_model,
                                             out_channels=configs.d_model,
-                                            seq_len=self.seq_len//2+self.pred_len,
+                                            seq_len=self.label_len+self.pred_len, # 수정됨
                                             modes=configs.modes,
                                             mode_select_method=configs.mode_select)
             decoder_cross_att = FourierCrossAttention(in_channels=configs.d_model,
                                                       out_channels=configs.d_model,
-                                                      seq_len_q=self.seq_len//2+self.pred_len,
+                                                      seq_len_q=self.label_len+self.pred_len, # 수정됨
                                                       seq_len_kv=self.seq_len,
                                                       modes=configs.modes,
                                                       mode_select_method=configs.mode_select)

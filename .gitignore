@@ -13,3 +13,5 @@ scripts/checkpoints
 scripts/baseline/*/checkpoints/
 scripts/baseline/*/logs/
 scripts/baseline/*/*results/
+scripts/AdaMamba/*.txt
+scripts/*.txt

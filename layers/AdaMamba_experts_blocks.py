@@ -1,13 +1,11 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from .Embed import PatchingEmbedding, PositionalEmbedding
 from .SelfAttention_Family import AttentionPool
 from mambapy.mamba import Mamba, MambaConfig
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 class ContextualTSA(nn.Module):
     def __init__(self, d_model, n_layers=2, d_state=16, expand_factor=2, dropout=0.1):
@@ -80,7 +78,7 @@ class MoETSAEncoderLayer(nn.Module):
 class ContextEncoder(nn.Module):
     def __init__(self, configs):
         super().__init__()
-        self.patching_embedding = PatchingEmbedding(configs.patch_len, configs.stride, configs.enc_in, configs.d_model)
+        self.patching_embedding = PatchingEmbedding(configs.patch_len, configs.stride, 1, configs.d_model)
         self.position_embedding = PositionalEmbedding(configs.d_model)
         self.encoder_layer =  MoETSAEncoderLayer(configs.d_model, configs.d_ff, configs.dropout)
         self.attention_pool = AttentionPool(d_model=configs.d_model, n_heads=configs.n_heads)
