@@ -22,27 +22,24 @@ class ContextualTSA(nn.Module):
         )
         self.mamba = Mamba(config)
 
-        # Output fusion
+        # Output projection (delta)
         self.out_proj = nn.Linear(d_model, d_model)
-        self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, src):
         """
         src: [B, L, d_model]
-        return: output [B, L, d_model]
+        return: delta  [B, L, d_model]
         """
-        src = self.norm(src)
-
         x1, x2 = src.chunk(2, dim=-1)  # [B,L,D/2] each
         context = self.mamba(x1)       # [B,L,D/2] — temporal context with gating
 
         y2 = x2 + context
         out = torch.cat([x1, y2], dim=-1)
-        return src + self.dropout(self.out_proj(out))
+        return self.dropout(self.out_proj(out))
 
 class FFN(nn.Module):
-    def __init__(self, d_model, d_ff, dropout=0.1):
+    def __init__(self, d_model, d_ff, dropout=0.1, mamba_layers=2):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d_model, d_ff),
@@ -56,22 +53,16 @@ class FFN(nn.Module):
         return self.net(x)
 
 class MoETSAEncoderLayer(nn.Module):
-    def __init__(self, d_model, d_ff, dropout=0.1):
+    def __init__(self, d_model, d_ff, dropout=0.1, mamba_layers=2):
         super().__init__()
-        self.tsa = ContextualTSA(d_model, dropout=dropout)
+        self.tsa = ContextualTSA(d_model, n_layers=mamba_layers, dropout=dropout)
         self.ffn = FFN(d_model, d_ff, dropout)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, src):
-        norm_src = self.norm1(src) 
-        src2 = self.tsa(norm_src)
-        src = norm_src + src2
-
-        norm_src = self.norm2(src)
-        src2 = self.ffn(norm_src)
-        src = norm_src + src2 
-
+        src = src + self.tsa(self.norm1(src))
+        src = src + self.ffn(self.norm2(src))
         return src
 
 class ContextEncoder(nn.Module):
