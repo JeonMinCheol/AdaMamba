@@ -9,65 +9,9 @@ import torch.distributed as dist
 
 import io
 from PIL import Image
-
-from statsmodels.tsa.stattools import adfuller
-from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
-
-from scipy.stats import pearsonr
-from sklearn.metrics.pairwise import cosine_similarity
 import os
-import pandas as pd # pandas가 없다면 추가
 
 plt.switch_backend('agg')
-
-class RMSNorm(nn.Module):
-    def __init__(self, d_model, eps=1e-8):
-        super().__init__()
-        self.scale = nn.Parameter(torch.ones(d_model))
-        self.eps = eps
-
-    def forward(self, x):
-        # Root Mean Square 계산
-        rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt()
-        return x / (rms + self.eps) * self.scale
-
-def dict_to_string(dict: dict):
-    ret = ""
-    for k, v in dict.items():
-        ret += k + ": " + str(v.item()) +", "
-    return ret
-
-def adjust_learning_rate(optimizer, scheduler, epoch, args, printout=True):
-    # lr = args.learning_rate * (0.2 ** (epoch // 2))
-    if args.lradj == 'type1':
-        lr_adjust = {epoch: args.learning_rate * (0.5 ** ((epoch - 1) // 1))}
-    elif args.lradj == 'type2':
-        lr_adjust = {
-            2: 5e-5, 4: 1e-5, 6: 5e-6, 8: 1e-6,
-            10: 5e-7, 15: 1e-7, 20: 5e-8
-        }
-    elif args.lradj == 'type3':
-        lr_adjust = {epoch: args.learning_rate if epoch < 3 else args.learning_rate * (0.9 ** ((epoch - 3) // 1))}
-    elif args.lradj == 'constant':
-        lr_adjust = {epoch: args.learning_rate}
-    elif args.lradj == '3':
-        lr_adjust = {epoch: args.learning_rate if epoch < 10 else args.learning_rate*0.1}
-    elif args.lradj == '4':
-        lr_adjust = {epoch: args.learning_rate if epoch < 15 else args.learning_rate*0.1}
-    elif args.lradj == '5':
-        lr_adjust = {epoch: args.learning_rate if epoch < 25 else args.learning_rate*0.1}
-    elif args.lradj == '6':
-        lr_adjust = {epoch: args.learning_rate if epoch < 5 else args.learning_rate*0.1}  
-    elif args.lradj == 'TST':
-        lr_adjust = {epoch: scheduler.get_last_lr()[0]}
-    
-    if epoch in lr_adjust.keys():
-        lr = lr_adjust[epoch]
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        
-        if printout:
-            print('Updating learning rate to {}'.format(lr))
 
 class EarlyStopping:
     def __init__(self, patience=7, verbose=True, delta=0):
@@ -99,6 +43,7 @@ class EarlyStopping:
         if best_val_loss + self.delta < self.val_loss_min:
             if dist.get_rank() == best_rank:
                 self.save_checkpoint(best_val_loss, test_loss, model, path, best_rank)
+            dist.barrier() 
             self.val_loss_min = best_val_loss
             self.counter = 0
         else:
@@ -115,9 +60,18 @@ class EarlyStopping:
         if self.verbose:
             print(f"[Rank {rank}] Validation loss decreased "
                   f"({self.val_loss_min:.6f} → {val_loss:.6f}). Saving model ...\nTest loss: {test_loss:6f}")
+            
         os.makedirs(path, exist_ok=True)
-        state_dict = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-        torch.save(state_dict, os.path.join(path, f"checkpoint.pth"))
+        m = model.module if hasattr(model, "module") else model
+        state_dict = m.state_dict()
+
+        # ✅ CPU로 옮겨서 저장 (device 꼬임 원천 차단)
+        cpu_state = {k: v.detach().cpu() for k, v in state_dict.items()}
+
+        tmp = os.path.join(path, "checkpoint.tmp.pth")
+        final = os.path.join(path, "checkpoint.pth")
+        torch.save(cpu_state, tmp)
+        os.replace(tmp, final)  
 
 class SimpleLogger:
     def __init__(self, log_dir="logs", filename="train_log.csv"):
@@ -166,6 +120,44 @@ class StandardScaler():
 
     def inverse_transform(self, data):
         return (data * self.std) + self.mean
+
+def dict_to_string(dict: dict):
+    ret = ""
+    for k, v in dict.items():
+        ret += k + ": " + str(v.item()) +", "
+    return ret
+
+def adjust_learning_rate(optimizer, scheduler, epoch, args, printout=True):
+    # lr = args.learning_rate * (0.2 ** (epoch // 2))
+    if args.lradj == 'type1':
+        lr_adjust = {epoch: args.learning_rate * (0.5 ** ((epoch - 1) // 1))}
+    elif args.lradj == 'type2':
+        lr_adjust = {
+            2: 5e-5, 4: 1e-5, 6: 5e-6, 8: 1e-6,
+            10: 5e-7, 15: 1e-7, 20: 5e-8
+        }
+    elif args.lradj == 'type3':
+        lr_adjust = {epoch: args.learning_rate if epoch < 3 else args.learning_rate * (0.9 ** ((epoch - 3) // 1))}
+    elif args.lradj == 'constant':
+        lr_adjust = {epoch: args.learning_rate}
+    elif args.lradj == '3':
+        lr_adjust = {epoch: args.learning_rate if epoch < 10 else args.learning_rate*0.1}
+    elif args.lradj == '4':
+        lr_adjust = {epoch: args.learning_rate if epoch < 15 else args.learning_rate*0.1}
+    elif args.lradj == '5':
+        lr_adjust = {epoch: args.learning_rate if epoch < 25 else args.learning_rate*0.1}
+    elif args.lradj == '6':
+        lr_adjust = {epoch: args.learning_rate if epoch < 5 else args.learning_rate*0.1}  
+    elif args.lradj == 'TST':
+        lr_adjust = {epoch: scheduler.get_last_lr()[0]}
+    
+    if epoch in lr_adjust.keys():
+        lr = lr_adjust[epoch]
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        
+        if printout:
+            print('Updating learning rate to {}'.format(lr))
 
 def visual(true, preds=None, name='./pic/test.pdf',
            title="Forecast vs Ground Truth",
@@ -280,24 +272,6 @@ def get_heatmap_image_tensor(attention_weights, sample_num=0, head_num=0):
 
     return img_tensor
 
-def log_layer_stats(writer, model, step, optimizer, prefix="stats"):
-    for name, p in model.named_parameters():
-        if not p.requires_grad: 
-            continue
-        w = p.data
-        g = p.grad
-        writer.add_scalar(f"weight_{prefix}/{name}_w_mean", w.mean().item(), step)
-        writer.add_scalar(f"weight_{prefix}/{name}_w_std", w.std().item(), step)
-        if g is None:
-            writer.add_scalar(f"grad_{prefix}/{name}_norm", 0.0, step)
-        else:
-            writer.add_scalar(f"grad_{prefix}/{name}_norm", g.norm().item(), step)
-
-        if p.grad is not None:
-            update = -optimizer.param_groups[0]['lr'] * p.grad
-            rel_update = (update.abs().mean() / (p.data.abs().mean() + 1e-8)).item()
-            writer.add_scalar(f"update_ratio/{name}", rel_update, step)
-
 def visual_trend(true_trend, pred_trend, raw_data=None, name='./trend_test.pdf'):
     """
     true_trend: (L, ) or (L, 1) - 실제 트렌드 (Moving Average 등)
@@ -320,29 +294,6 @@ def visual_trend(true_trend, pred_trend, raw_data=None, name='./trend_test.pdf')
     plt.savefig(name, bbox_inches='tight', dpi=300)
     plt.close()
 
-# [Added] 트렌드 유사도 계산 함수
-def calc_trend_similarity(true_trend, pred_trend):
-    """
-    MSE와 Cosine Similarity를 계산하여 반환
-    """
-    # MSE
-    mse = np.mean((true_trend - pred_trend)**2)
-    
-    # Cosine Similarity
-    t = true_trend.flatten()
-    p = pred_trend.flatten()
-    
-    norm_t = np.linalg.norm(t)
-    norm_p = np.linalg.norm(p)
-    
-    if norm_t == 0 or norm_p == 0:
-        cos_sim = 0.0
-    else:
-        cos_sim = np.dot(t, p) / (norm_t * norm_p)
-        
-    return mse, cos_sim
-
-# [Added] Moving Average 계산 함수 (Ground Truth Trend 생성용)
 def moving_average(data, kernel_size=25):
     """
     data: (B, L, D) Tensor
