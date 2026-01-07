@@ -36,14 +36,24 @@ def unwrap_model(m: nn.Module) -> nn.Module:
         m = m.module
     return m
 
-
 class Exp_Main(Exp_Basic):
     def __init__(self, args):
         super(Exp_Main, self).__init__(args)
 
     def _build_model(self):
         # kernels parse
-        self.args.kernels = [int(x) for x in self.args.kernels.split(',') if x.strip() != ""]
+        # --- kernels parse (safe) ---
+        k = getattr(self.args, "kernels", None)
+
+        if k is None:
+            self.args.kernels = []
+        elif isinstance(k, (list, tuple)):
+            self.args.kernels = [int(x) for x in k]
+        elif isinstance(k, str):
+            self.args.kernels = [int(x) for x in k.split(",") if x.strip() != ""]
+        else:
+            raise TypeError(f"args.kernels must be str/list/tuple, got {type(k)}")
+
         print(f"Using kernel sizes: {self.args.kernels}")
 
         # --- DDP init ---
@@ -105,9 +115,6 @@ class Exp_Main(Exp_Basic):
     def _select_criterion(self):
         return nn.MSELoss()
 
-    # -------------------------
-    # ✅ DDP 안전: AdaMamba sample 호출 래퍼
-    # -------------------------
     def _sample_adamamba(self, batch_x):
         m = unwrap_model(self.model)  # DDP면 module, 아니면 self.model
         return m.sample(batch_x)
@@ -132,9 +139,9 @@ class Exp_Main(Exp_Basic):
                 if self.args.model == "AdaMamba":
                     if self.args.use_amp:
                         with torch.amp.autocast(device_type="cuda"):
-                            outputs, batch_trend = self._sample_adamamba(batch_x)
+                            outputs, _ = self._sample_adamamba(batch_x)
                     else:
-                        outputs, batch_trend = self._sample_adamamba(batch_x)
+                        outputs, _ = self._sample_adamamba(batch_x)
 
                     # NOTE: 네 코드 로직 그대로 유지 (하지만 이건 epoch 동안 계속 누적이라 메모리/의미상 이상함)
                     predictions_on_cpu.append(outputs.detach().cpu())
@@ -324,6 +331,9 @@ class Exp_Main(Exp_Basic):
         self.model.eval()
         test_data, test_loader, _ = self._get_data(flag='test')
 
+        if self.args.use_multi_gpu:
+            dist.barrier()
+
         if test:
             if self.args.use_multi_gpu:
                 dist.barrier()
@@ -338,6 +348,9 @@ class Exp_Main(Exp_Basic):
         preds, trues, inputx = [], [], []
         folder_path = './test_results/' + setting + '/'
         os.makedirs(folder_path, exist_ok=True)
+
+        # ✅ DDP면 시각화/파일저장은 rank0만
+        do_viz = (not self.args.use_multi_gpu) or (self.rank == 0)
 
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(tqdm(test_loader, desc="Test")):
@@ -380,64 +393,72 @@ class Exp_Main(Exp_Basic):
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.pred_len:, f_dim:].to(self.device)
+                batch_y_predpart = batch_y[:, -self.pred_len:, f_dim:]  # ✅ torch (B,P,D)
 
-                outputs = outputs.detach().cpu().numpy()
-                batch_y = batch_y.detach().cpu().numpy()
+                # ✅ numpy로 저장 (메트릭용)
+                outputs_np = outputs.detach().cpu().numpy()
+                batch_y_np = batch_y_predpart.detach().cpu().numpy()
 
-                preds.append(outputs)
-                trues.append(batch_y)
+                preds.append(outputs_np)
+                trues.append(batch_y_np)
                 inputx.append(batch_x.detach().cpu().numpy())
 
-                if i % 20 == 0: # 숫자 변경
-                    # input = batch_x.detach().cpu().numpy()
-                    # gt = np.concatenate((input[0, :, -1], trues[0, :, -1]), axis=0)
-                    # pd = np.concatenate((input[0, :, -1], preds[0, :, -1]), axis=0)
-                    # visual(gt, pd, os.path.join(folder_path, str(i) + '.pdf'))
+                if self.args.use_multi_gpu:
+                    dist.barrier()
 
-                    if self.args.model == "AdaMamba":
-                        # Prepare Ground Truth Data (Input + Target)
-                        # batch_x: (B, L, D), batch_y is already truncated to pred_len in loop but original is available?
-                        # No, batch_y here is already sliced. We need the full y or construct it.
-                        # Actually batch_y from loader usually has label_len + pred_len.
-                        # But in the loop above: batch_y = batch_y[:, -self.pred_len:, f_dim:]
-                        # So we can concat batch_x and batch_y (prediction part).
-                        # batch_trend from model likely covers L+pred_len.
-                        
-                        # Reconstruct full GT sequence for the first sample in batch
-                        input_tensor = batch_x.detach() # (B, L, D)
-                        # Note: true variable is numpy array of prediction part only
-                        true_tensor = torch.from_numpy(trues).to(self.device) # (B, P, D)
-                        
-                        gt_seq = torch.cat([input_tensor, true_tensor], dim=1) # (B, L+P, D)
-                        
-                        # Calculate Actual Trend using Moving Average
-                        # Use kernel size from args if available, else default 25
-                        k_size = getattr(self.args, 'moving_avg', 25)
-                        if isinstance(k_size, list): k_size = k_size[0] # handle list case
-                        
-                        gt_trend = moving_average(gt_seq, kernel_size=k_size)
-                        
-                        # Extract Data for Visualization (1st sample, last channel)
-                        # batch_trend is (B, TrendLen, D)
-                        
-                        # Length check to avoid shape mismatch
-                        t_len = min(gt_trend.shape[1], batch_trend.shape[1])
-                        
-                        gt_trend_np = gt_trend[0, :t_len, -1].detach().cpu().numpy()
-                        pred_trend_np = batch_trend[0, :t_len, -1].detach().cpu().numpy()
-                        raw_data_np = gt_seq[0, :t_len, -1].detach().cpu().numpy()
-                        
-                        # Visualize
-                        visual_trend(gt_trend_np, pred_trend_np, raw_data_np, 
-                                        name=os.path.join(folder_path, 'trend_comparison_' + str(i) + '.pdf'))
-                        self.visualize_kernel_weights(self.model, test_loader, self.device, kernel_sizes=self.kernels,
-                                                    save_path=os.path.join(folder_path, 'kernel_weights_' + str(i) + '.pdf'))
+                # -------------------------
+                # ✅ 시각화 (rank0 only)
+                # -------------------------
+                if do_viz and (i % 20 == 0) and (self.args.model == "AdaMamba"):
+                    # input_tensor: torch (B,L,D)
+                    input_tensor = batch_x.detach()  # 이미 device 위 torch
+
+                    # ✅ trues(list) 말고 "현재 배치 GT"를 써야 함
+                    true_tensor = batch_y_predpart.detach()  # torch (B,P,D)
+
+                    # dtype 일치 보장
+                    if true_tensor.dtype != input_tensor.dtype:
+                        true_tensor = true_tensor.to(input_tensor.dtype)
+
+                    gt_seq = torch.cat([input_tensor, true_tensor], dim=1)  # (B,L+P,D)
+
+                    k_size = getattr(self.args, 'moving_avg', 25)
+                    if isinstance(k_size, list):
+                        k_size = k_size[0]
+
+                    gt_trend = moving_average(gt_seq, kernel_size=k_size)
+
+                    # batch_trend가 torch가 아닐 수도 있어서 안전 처리
+                    if isinstance(batch_trend, np.ndarray):
+                        batch_trend_t = torch.from_numpy(batch_trend).to(self.device)
+                    else:
+                        batch_trend_t = batch_trend
+
+                    t_len = min(gt_trend.shape[1], batch_trend_t.shape[1])
+
+                    gt_trend_np = gt_trend[0, :t_len, -1].detach().cpu().numpy()
+                    pred_trend_np = batch_trend_t[0, :t_len, -1].detach().cpu().numpy()
+                    raw_data_np = gt_seq[0, :t_len, -1].detach().cpu().numpy()
+                    try:
+                        visual_trend(
+                            gt_trend_np, pred_trend_np, raw_data_np,
+                            name=os.path.join(folder_path, f"trend_comparison_{i}.pdf")
+                        )
+
+                        # ✅ 이 함수도 내부에서 rank0 체크하고 있긴 한데, 밖에서 한 번 더 막음
+                        self.visualize_kernel_weights(
+                            self.model, test_loader, self.device, kernels=self.args.kernels,
+                            save_path=os.path.join(folder_path, f"kernel_weights_{i}.pdf")
+                        )
+                    except Exception as e:
+                        print(f"Visualization error at batch {i}: {e}")
+
 
         if self.args.test_flop:
             test_params_flop(self.model, (batch_x.shape[1], batch_x.shape[2]))
             exit()
 
+        # reshape (list->array)
         preds = np.array(preds).reshape(-1, preds[0].shape[-2], preds[0].shape[-1])
         trues = np.array(trues).reshape(-1, trues[0].shape[-2], trues[0].shape[-1])
         inputx = np.array(inputx).reshape(-1, inputx[0].shape[-2], inputx[0].shape[-1])
@@ -448,9 +469,6 @@ class Exp_Main(Exp_Basic):
             with open("result.txt", "a") as f:
                 f.write(setting + "\n")
                 f.write(f'mae:{mae}, mse:{mse}, rmse:{rmse}, mape:{mape}, mspe:{mspe}, rse:{rse}\n\n')
-
-        if self.args.use_multi_gpu:
-            dist.destroy_process_group()
 
         return
 
@@ -519,12 +537,11 @@ class Exp_Main(Exp_Basic):
         if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
             np.save(folder_path + 'real_prediction.npy', preds)
 
-        dist.destroy_process_group()
         return
 
     def analysis_batch(self, batch_x, setting):
         # DDP면 rank0만 저장 (중복 저장 방지)
-        if dist.is_available() and dist.is_initialized():
+        if is_ddp():
             if dist.get_rank() != 0:
                 return
 
@@ -631,7 +648,7 @@ class Exp_Main(Exp_Basic):
         model,
         data_loader,
         device,
-        kernel_sizes,
+        kernels,
         save_path='./pic/kernel_weights.pdf',
         max_batches=20
     ):
@@ -684,7 +701,7 @@ class Exp_Main(Exp_Basic):
                     return
 
                 B, CK, L = cat_trends.shape
-                K = len(kernel_sizes)
+                K = len(kernels)
                 if CK % K != 0:
                     # 예상치 못한 shape면 스킵
                     return
@@ -725,8 +742,8 @@ class Exp_Main(Exp_Basic):
         avg_weights = torch.stack(captured_weights, dim=0).mean(dim=0).numpy()  # [K]
 
         plt.figure(figsize=(10, 5))
-        colors = plt.cm.viridis(np.linspace(0, 0.8, len(kernel_sizes)))
-        bars = plt.bar([str(k) for k in kernel_sizes], avg_weights,
+        colors = plt.cm.viridis(np.linspace(0, 0.8, len(kernels)))
+        bars = plt.bar([str(k) for k in kernels], avg_weights,
                     color=colors, edgecolor='black', alpha=0.8)
 
         plt.title('Learned Kernel Gates (KernelSE Importance per Scale)', fontsize=14, fontweight='bold')
@@ -747,3 +764,6 @@ class Exp_Main(Exp_Basic):
 
         return avg_weights
 
+    if is_ddp():
+        dist.barrier()
+        dist.destroy_process_group()
