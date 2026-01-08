@@ -41,21 +41,6 @@ class Exp_Main(Exp_Basic):
         super(Exp_Main, self).__init__(args)
 
     def _build_model(self):
-        # kernels parse
-        # --- kernels parse (safe) ---
-        k = getattr(self.args, "kernels", None)
-
-        if k is None:
-            self.args.kernels = []
-        elif isinstance(k, (list, tuple)):
-            self.args.kernels = [int(x) for x in k]
-        elif isinstance(k, str):
-            self.args.kernels = [int(x) for x in k.split(",") if x.strip() != ""]
-        else:
-            raise TypeError(f"args.kernels must be str/list/tuple, got {type(k)}")
-
-        print(f"Using kernel sizes: {self.args.kernels}")
-
         # --- DDP init ---
         if self.args.use_multi_gpu and self.args.use_gpu:
             if not is_ddp():
@@ -71,6 +56,22 @@ class Exp_Main(Exp_Basic):
         else:
             self.device = torch.device("cuda" if self.args.use_gpu else "cpu")
             self.rank = 0
+
+        if self.args.model == 'AdaMamba':
+            # kernels parse
+            k = getattr(self.args, "kernels", None)
+
+            if k is None:
+                self.args.kernels = []
+            elif isinstance(k, (list, tuple)):
+                self.args.kernels = [int(x) for x in k]
+            elif isinstance(k, str):
+                self.args.kernels = [int(x) for x in k.split(",") if x.strip() != ""]
+            else:
+                raise TypeError(f"args.kernels must be str/list/tuple, got {type(k)}")
+
+            if self.rank == 0:
+                print(f"Using kernel sizes: {self.args.kernels}")
 
         model_dict = {
             'FEDformer': FEDformer,
@@ -90,14 +91,13 @@ class Exp_Main(Exp_Basic):
 
         model = model_dict[self.args.model].Model(self.args).float().to(self.device)
 
-        # --- DDP wrap (✅ unwrap 금지) ---
         if self.args.use_multi_gpu and self.args.use_gpu:
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
             model = nn.parallel.DistributedDataParallel(
                 model,
                 device_ids=[self.device.index],
                 output_device=self.device.index,
-                find_unused_parameters=False,
+                find_unused_parameters=True,
                 broadcast_buffers=False,
             )
             if self.rank == 0:
