@@ -1,3 +1,4 @@
+import math
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
 from models import AdaMamba, Informer, Autoformer, Transformer, DLinear, Linear, NLinear, PatchTST, iTransformer, ModernTCN, FEDformer, TimeMixer, MambaTS
@@ -10,7 +11,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch import optim
-from torch.optim import lr_scheduler
 import torch.distributed as dist
 
 import os
@@ -25,7 +25,6 @@ warnings.filterwarnings('ignore')
 
 import tempfile
 tempfile.tempdir = "/dev/shm"
-
 
 def is_ddp() -> bool:
     return dist.is_available() and dist.is_initialized()
@@ -136,47 +135,24 @@ class Exp_Main(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
-                if self.args.model == "AdaMamba":
-                    if self.args.use_amp:
-                        with torch.amp.autocast(device_type="cuda"):
-                            outputs, _ = self._sample_adamamba(batch_x)
-                    else:
-                        outputs, _ = self._sample_adamamba(batch_x)
-
-                    # NOTE: 네 코드 로직 그대로 유지 (하지만 이건 epoch 동안 계속 누적이라 메모리/의미상 이상함)
-                    predictions_on_cpu.append(outputs.detach().cpu())
-                    stacked_predictions = torch.stack(predictions_on_cpu, dim=0)
-                    outputs = torch.mean(stacked_predictions, dim=0)
-
-                else:
-                    if self.args.use_amp:
-                        with torch.amp.autocast(device_type="cuda"):
-                            if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
-                                outputs = self.model(batch_x)
-                            elif 'TCN' in self.args.model:
-                                outputs = self.model(batch_x, batch_x_mark)
-                            else:
-                                if self.args.output_attention:
-                                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                                else:
-                                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                    else:
-                        if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
-                            outputs = self.model(batch_x)
-                        elif 'TCN' in self.args.model:
-                            outputs = self.model(batch_x, batch_x_mark)
-                        else:
-                            if self.args.output_attention:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                            else:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
                 f_dim = -1 if self.args.features == 'MS' else 0
-                outputs = outputs[:, -self.pred_len:, f_dim:]
-                batch_y = batch_y[:, -self.pred_len:, f_dim:].to(self.device)
+                y = batch_y[:, -self.pred_len:, f_dim:]
 
+                if self.args.model == "AdaMamba":
+                    outputs, _ = self._sample_adamamba(batch_x)
+                else:
+                    if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
+                        outputs = self.model(batch_x)
+                    elif 'TCN' in self.args.model:
+                        outputs = self.model(batch_x, batch_x_mark)
+                    else:
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
+                        else:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                outputs = outputs[:, -self.pred_len:, f_dim:]
                 pred = outputs.detach().cpu()
-                true = batch_y.detach().cpu()
+                true = y.detach().cpu()
                 preds.append(pred); trues.append(true)
 
                 loss = criterion(pred, true)
@@ -196,29 +172,16 @@ class Exp_Main(Exp_Basic):
 
     def train(self, setting):
         self.model.train()
-        train_data, train_loader, sampler = self._get_data(flag='train')
-        vali_data, vali_loader, _ = self._get_data(flag='val')
-        test_data, test_loader, _ = self._get_data(flag='test')
+        _, train_loader, sampler = self._get_data(flag='train')
+        _, vali_loader, _ = self._get_data(flag='val')
+        _, test_loader, _ = self._get_data(flag='test')
 
         path = os.path.join(self.args.checkpoints, setting)
         os.makedirs(path, exist_ok=True)
-
-        train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
         model_optim = self._select_optimizer()
         criterion = self._select_criterion()
-
-        if self.args.use_amp:
-            scaler = torch.amp.GradScaler()
-
-        scheduler = lr_scheduler.OneCycleLR(
-            optimizer=model_optim,
-            steps_per_epoch=train_steps,
-            pct_start=self.args.pct_start,
-            epochs=self.args.train_epochs,
-            max_lr=self.args.learning_rate
-        )
 
         for epoch in range(self.args.train_epochs):
             train_loss = []
@@ -236,64 +199,31 @@ class Exp_Main(Exp_Basic):
                 dec_inp = torch.zeros_like(batch_y[:, -self.pred_len:, :]).float()
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
+                f_dim = -1 if self.args.features == 'MS' else 0
+                y = batch_y[:, -self.pred_len:, f_dim:].to(self.device)
+
                 if self.args.model != "AdaMamba":
-                    if self.args.use_amp:
-                        with torch.amp.autocast(device_type="cuda"):
-                            if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
-                                outputs = self.model(batch_x, batch_y)
-                            elif 'TCN' in self.args.model:
-                                outputs = self.model(batch_x, batch_x_mark)
-                            else:
-                                if self.args.output_attention:
-                                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                                else:
-                                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-
-                            f_dim = -1 if self.args.features == 'MS' else 0
-                            outputs = outputs[:, -self.pred_len:, f_dim:]
-                            y = batch_y[:, -self.pred_len:, f_dim:].to(self.device)
-                            loss = criterion(outputs, y)
-
-                        scaler.scale(loss).backward()
-                        scaler.step(model_optim)
-                        scaler.update()
-                        train_loss.append(loss.item())
+                    if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
+                        outputs = self.model(batch_x)
+                    elif 'TCN' in self.args.model:
+                        outputs = self.model(batch_x, batch_x_mark)
                     else:
-                        if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
-                            outputs = self.model(batch_x)
-                        elif 'TCN' in self.args.model:
-                            outputs = self.model(batch_x, batch_x_mark)
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                         else:
-                            if self.args.output_attention:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                            else:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, batch_y)
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark, batch_y)
 
-                        f_dim = -1 if self.args.features == 'MS' else 0
-                        outputs = outputs[:, -self.pred_len:, f_dim:]
-                        y = batch_y[:, -self.pred_len:, f_dim:].to(self.device)
-                        loss = criterion(outputs, y)
-                        loss.backward()
-                        model_optim.step()
-                        train_loss.append(loss.item())
+                    outputs = outputs[:, -self.pred_len:, f_dim:]
+                    loss = criterion(outputs, y)
+                    loss.backward()
+                    model_optim.step()
+                    train_loss.append(loss.item())
 
                 else:
-                    if self.args.use_amp:
-                        with torch.amp.autocast(device_type="cuda"):
-                            total_loss = self.model(batch_x, batch_y)
-                        scaler.scale(total_loss).backward()
-                        scaler.step(model_optim)
-                        scaler.update()
-                        train_loss.append(total_loss.item())
-                    else:
-                        total_loss = self.model(batch_x, batch_y)
-                        total_loss.backward()
-                        model_optim.step()
-                        train_loss.append(total_loss.item())
-
-                if self.args.lradj == 'TST':
-                    adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, printout=False)
-                    scheduler.step()
+                    total_loss = self.model(batch_x, y)
+                    total_loss.backward()
+                    model_optim.step()
+                    train_loss.append(total_loss.item())
 
             train_loss = np.average(train_loss)
             epoch_end_time = time.time()
@@ -304,24 +234,33 @@ class Exp_Main(Exp_Basic):
             if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
                 print("[RANK {}] Epoch: {} cost time: {:.2f} | Train: {:.6f}, Val: {:.6f}, Test: {:.6f}".format(
                     self.rank, epoch + 1, epoch_end_time - epoch_start_time, train_loss, vali_loss, test_loss))
-
+            
             early_stopping(vali_loss, test_loss, self.model, path)
             if early_stopping.early_stop:
                 if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
                     print("Early stopping")
                 break
-
-            if self.args.lradj != 'TST':
-                adjust_learning_rate(model_optim, scheduler, epoch + 1, self.args, False)
-            elif (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
-                print('Updating learning rate to {}'.format(scheduler.get_last_lr()[0]))
+            if math.isnan(train_loss):
+                if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
+                    print("NaN detected, stopping training.")
+                return self.model
 
         # ✅ best ckpt load (CPU)
         best_model_path = os.path.join(path, "checkpoint.pth")
         if self.args.use_multi_gpu:
             dist.barrier()
         state = torch.load(best_model_path, map_location="cpu")
-        unwrap_model(self.model).load_state_dict(state, strict=True)
+        try:
+            unwrap_model(self.model).load_state_dict(state, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed to load best checkpoint from {best_model_path}. "
+                "This usually means the checkpoint directory was reused with a different model "
+                "shape, often because kernels or normalization settings changed. "
+                "Try using a unique setting name per kernel configuration or remove the stale "
+                "checkpoint directory before rerunning.\n"
+                f"Original error:\n{exc}"
+            ) from exc
         if self.args.use_multi_gpu:
             dist.barrier()
 
@@ -363,44 +302,28 @@ class Exp_Main(Exp_Basic):
                 dec_inp = torch.cat([batch_y[:, :self.args.label_len, :], dec_inp], dim=1).float().to(self.device)
 
                 if self.args.model == "AdaMamba":
-                    if self.args.use_amp:
-                        with torch.amp.autocast(device_type="cuda"):
-                            outputs, batch_trend = self._sample_adamamba(batch_x)
-                    else:
-                        outputs, batch_trend = self._sample_adamamba(batch_x)
+                    outputs, batch_trend = self._sample_adamamba(batch_x)
                 else:
-                    if self.args.use_amp:
-                        with torch.amp.autocast(device_type="cuda"):
-                            if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
-                                outputs = self.model(batch_x)
-                            elif 'TCN' in self.args.model:
-                                outputs = self.model(batch_x, batch_x_mark)
-                            else:
-                                if self.args.output_attention:
-                                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                                else:
-                                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
+                        outputs = self.model(batch_x)
+                    elif 'TCN' in self.args.model:
+                        outputs = self.model(batch_x, batch_x_mark)
                     else:
-                        if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
-                            outputs = self.model(batch_x)
-                        elif 'TCN' in self.args.model:
-                            outputs = self.model(batch_x, batch_x_mark)
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                         else:
-                            if self.args.output_attention:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                            else:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
 
                 f_dim = -1 if self.args.features == 'MS' else 0
                 outputs = outputs[:, -self.pred_len:, f_dim:]
-                batch_y_predpart = batch_y[:, -self.pred_len:, f_dim:]  # ✅ torch (B,P,D)
+                y = batch_y[:, -self.pred_len:, f_dim:]
 
                 # ✅ numpy로 저장 (메트릭용)
                 outputs_np = outputs.detach().cpu().numpy()
-                batch_y_np = batch_y_predpart.detach().cpu().numpy()
+                y_np = y.detach().cpu().numpy()
 
                 preds.append(outputs_np)
-                trues.append(batch_y_np)
+                trues.append(y_np)
                 inputx.append(batch_x.detach().cpu().numpy())
 
                 if self.args.use_multi_gpu:
@@ -409,12 +332,19 @@ class Exp_Main(Exp_Basic):
                 # -------------------------
                 # ✅ 시각화 (rank0 only)
                 # -------------------------
-                if do_viz and (i % 20 == 0) and (self.args.model == "AdaMamba"):
+                # RevIN/None에서는 kernel attention 시각화 대상이 없어 불필요한
+                # matplotlib/hook 경로를 타지 않도록 AdaNorm일 때만 시각화합니다.
+                if (
+                    do_viz
+                    and (i % 20 == 0)
+                    and (self.args.model == "AdaMamba")
+                    and (getattr(self.args, "norm_type", "") == "AdaNorm")
+                ):
                     # input_tensor: torch (B,L,D)
                     input_tensor = batch_x.detach()  # 이미 device 위 torch
 
                     # ✅ trues(list) 말고 "현재 배치 GT"를 써야 함
-                    true_tensor = batch_y_predpart.detach()  # torch (B,P,D)
+                    true_tensor = y.detach()  # torch (B,P,D)
 
                     # dtype 일치 보장
                     if true_tensor.dtype != input_tensor.dtype:
@@ -434,11 +364,16 @@ class Exp_Main(Exp_Basic):
                     else:
                         batch_trend_t = batch_trend
 
-                    t_len = min(gt_trend.shape[1], batch_trend_t.shape[1])
+                    # Compare on the same forecast horizon window.
+                    # batch_trend_t is already forecast trend [B, pred_len, D].
+                    t_len = min(true_tensor.shape[1], batch_trend_t.shape[1])
+                    gt_trend_forecast = gt_trend[:, -t_len:, :]
+                    raw_forecast = true_tensor[:, :t_len, :]
+                    pred_trend_forecast = batch_trend_t[:, :t_len, :]
 
-                    gt_trend_np = gt_trend[0, :t_len, -1].detach().cpu().numpy()
-                    pred_trend_np = batch_trend_t[0, :t_len, -1].detach().cpu().numpy()
-                    raw_data_np = gt_seq[0, :t_len, -1].detach().cpu().numpy()
+                    gt_trend_np = gt_trend_forecast[0, :, -1].detach().cpu().numpy()
+                    pred_trend_np = pred_trend_forecast[0, :, -1].detach().cpu().numpy()
+                    raw_data_np = raw_forecast[0, :, -1].detach().cpu().numpy()
                     try:
                         visual_trend(
                             gt_trend_np, pred_trend_np, raw_data_np,
@@ -496,35 +431,19 @@ class Exp_Main(Exp_Basic):
 
                 # encoder - decoder
                 if self.args.model == "AdaMamba":
-                    if self.args.use_amp:
-                        with torch.amp.autocast():
-                            outputs, batch_trend = self.model.sample(batch_x)
-                    else:
-                        outputs, batch_trend = self.model.sample(batch_x)
+                    outputs, batch_trend = self.model.sample(batch_x)
                         
                 else:
-                    if self.args.use_amp:
-                        with torch.amp.autocast():
-                            if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
-                                outputs = self.model(batch_x)
-                            elif 'TCN' in self.args.model:
-                                outputs = self.model(batch_x, batch_x_mark)
-                            else:
-                                if self.args.output_attention:
-                                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                                else:
-                                    outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                    if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
+                        outputs = self.model(batch_x)
+                    elif 'TCN' in self.args.model:
+                        outputs = self.model(batch_x, batch_x_mark)
                     else:
-                        if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
-                            outputs = self.model(batch_x)
-                        elif 'TCN' in self.args.model:
-                            outputs = self.model(batch_x, batch_x_mark)
+                        if self.args.output_attention:
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
                         else:
-                            if self.args.output_attention:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)[0]
-                            else:
-                                outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
-                pred = outputs.detach().cpu().numpy()  
+                            outputs = self.model(batch_x, batch_x_mark, dec_inp, batch_y_mark)
+                pred = outputs.detach().cpu().numpy()
                 preds.append(pred)
 
         preds = np.array(preds)
@@ -556,28 +475,25 @@ class Exp_Main(Exp_Basic):
             print(">>> [Analysis] Skipping: Model is not AdaMamba")
             return
 
-        if not hasattr(model_engine, 'adaptive_norm_block'):
-            print(">>> [Analysis Error] Model missing 'adaptive_norm_block'")
+        if not hasattr(model_engine, 'get_input_processing_components'):
+            print(">>> [Analysis Error] Model missing 'get_input_processing_components'")
             print(f"    Available attributes: {list(model_engine.__dict__.keys())}")
             return
 
-        # 2) Trend 추출 (✅ [B,L,M] 그대로 normalize)
+        # 2) Trend 추출 / 정규화 분리 확인
         try:
             with torch.no_grad():
                 batch_x = batch_x.float().to(self.device)  # [B,L,M]
-                if hasattr(model_engine.adaptive_norm_block, 'normalize'):
-                    # new signature: x_norm, means, stdev, trend, alpha_gate
-                    out = model_engine.adaptive_norm_block.normalize(batch_x)
-                    if len(out) == 5:
-                        _, _, _, trend, alpha_gate = out
-                    else:
-                        # 혹시 옛날 4개면 fallback
-                        _, _, _, trend = out
-                        alpha_gate = None
-                else:
-                    print(f">>> [Analysis Error] 'adaptive_norm_block' exists but has no 'normalize' method.")
-                    print(f"    Current Norm Type: {getattr(model_engine, 'norm_type', 'Unknown')}")
-                    return
+                components = model_engine.get_input_processing_components(batch_x)
+                trend = components['trend']
+                normalized_x = components['normalized_x']
+                means = components['means']
+                stdev = components['stdev']
+                print(
+                    ">>> [Analysis] trend / normalized / means / stdev shapes: "
+                    f"{tuple(trend.shape)} / {tuple(normalized_x.shape)} / "
+                    f"{tuple(means.shape)} / {tuple(stdev.shape)}"
+                )
         except Exception as e:
             print(f">>> [Analysis Error] Trend extraction failed: {e}")
             return
@@ -653,9 +569,9 @@ class Exp_Main(Exp_Basic):
         max_batches=20
     ):
         """
-        AdaMamba의 KernelSE(커널 중요도 게이트 g)를 시각화합니다.
-        - KernelSE는 [B, C*K, L] 입력을 받아 [B, C, K] 게이트를 만들므로,
-        훅에서 동일 계산을 재현해 g를 캡처합니다.
+        AdaMamba의 kernel attention 가중치를 시각화합니다.
+        - 최신 구현은 softmax kernel attention 출력을 직접 캡처합니다.
+        - 구형 KernelSE가 남아 있으면 기존 로직으로 fallback 합니다.
         """
 
         # -----------------------------
@@ -675,43 +591,50 @@ class Exp_Main(Exp_Basic):
         model_engine.eval()
 
         # -----------------------------
-        # 2) KernelSE 모듈 찾기
+        # 2) kernel attention 모듈 찾기
         # -----------------------------
         target_module = None
+        target_kind = None
         if hasattr(model_engine, 'adaptive_norm_block'):
             norm_block = model_engine.adaptive_norm_block
-            if hasattr(norm_block, 'detrender') and hasattr(norm_block.detrender, 'kernel_se'):
-                target_module = norm_block.detrender.kernel_se
+            if hasattr(norm_block, 'detrender'):
+                if hasattr(norm_block.detrender, 'kernel_attention'):
+                    target_module = norm_block.detrender.kernel_attention
+                    target_kind = 'softmax'
+                elif hasattr(norm_block.detrender, 'kernel_se'):
+                    target_module = norm_block.detrender.kernel_se
+                    target_kind = 'legacy'
 
         if target_module is None:
-            print("Error: KernelSE 모듈을 찾을 수 없습니다. (adaptive_norm_block.detrender.kernel_se)")
+            print("Error: kernel attention 모듈을 찾을 수 없습니다. (adaptive_norm_block.detrender.kernel_attention)")
             return None
 
         captured_weights = []
 
         # -----------------------------
-        # 3) hook: KernelSE 게이트 g를 재현해서 캡처
+        # 3) hook: attention weights 캡처
         # -----------------------------
         def hook_fn(module, inputs, output):
-            # module: KernelSE
-            # inputs[0]: cat_trends [B, C*K, L]
             with torch.no_grad():
+                if target_kind == 'softmax':
+                    alpha = output
+                    if alpha.dim() != 3:
+                        return
+                    alpha_mean = alpha.mean(dim=(0, 1))  # [K]
+                    captured_weights.append(alpha_mean.cpu())
+                    return
+
                 cat_trends = inputs[0]
                 if cat_trends.dim() != 3:
                     return
 
-                B, CK, L = cat_trends.shape
+                B, CK, _ = cat_trends.shape
                 K = len(kernels)
                 if CK % K != 0:
-                    # 예상치 못한 shape면 스킵
                     return
                 C = CK // K
-
-                # KernelSE 내부 로직 재현
                 s = cat_trends.mean(dim=2).view(B, C, K)        # [B,C,K]
                 g = module.mlp(s.view(B * C, K)).view(B, C, K)  # [B,C,K] (0,1)
-
-                # 배치/채널 평균해서 [K]로 축약해 저장
                 g_mean = g.mean(dim=(0, 1))  # [K]
                 captured_weights.append(g_mean.cpu())
 
@@ -720,12 +643,11 @@ class Exp_Main(Exp_Basic):
         # -----------------------------
         # 4) 데이터 순회하면서 sample 호출로 hook 트리거
         # -----------------------------
-        print("Collecting kernel weights (KernelSE gates)...")
+        print("Collecting kernel weights...")
         with torch.no_grad():
             for i, batch in enumerate(data_loader):
-                # loader가 (batch_x, _, _, _) 형태라고 가정
                 batch_x = batch[0].float().to(device)  # [B,L,M] 기대
-                model_engine.sample(batch_x)           # forward 내부에서 kernel_se 호출되며 hook 트리거
+                model_engine.sample(batch_x)
 
                 if i >= max_batches:
                     break
@@ -733,7 +655,7 @@ class Exp_Main(Exp_Basic):
         hook.remove()
 
         if len(captured_weights) == 0:
-            print("Warning: No kernel weights were captured. (KernelSE가 호출되지 않았거나 shape mismatch)")
+            print("Warning: No kernel weights were captured. (kernel attention이 호출되지 않았거나 shape mismatch)")
             return None
 
         # -----------------------------
@@ -746,9 +668,9 @@ class Exp_Main(Exp_Basic):
         bars = plt.bar([str(k) for k in kernels], avg_weights,
                     color=colors, edgecolor='black', alpha=0.8)
 
-        plt.title('Learned Kernel Gates (KernelSE Importance per Scale)', fontsize=14, fontweight='bold')
-        plt.xlabel('Kernel Size (Fibonacci)', fontsize=12)
-        plt.ylabel('Average Gate (0~1)', fontsize=12)
+        plt.title('Learned Kernel Attention per Scale', fontsize=14, fontweight='bold')
+        plt.xlabel('Kernel Size', fontsize=12)
+        plt.ylabel('Average Attention Weight', fontsize=12)
         plt.grid(axis='y', linestyle='--', alpha=0.7)
 
         for bar in bars:
