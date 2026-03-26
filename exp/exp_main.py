@@ -5,13 +5,10 @@ from models import AdaMamba, Informer, Autoformer, Transformer, DLinear, Linear,
 from utils.tools import *
 from utils.metrics import metric
 from tqdm import tqdm
-from datetime import timedelta
-
 import numpy as np
 import torch
 import torch.nn as nn
 from torch import optim
-import torch.distributed as dist
 
 import os
 import time
@@ -27,7 +24,7 @@ import tempfile
 tempfile.tempdir = "/dev/shm"
 
 def is_ddp() -> bool:
-    return dist.is_available() and dist.is_initialized()
+    return False
 
 def unwrap_model(m: nn.Module) -> nn.Module:
     # DDP/DataParallel 둘 다 대응
@@ -40,21 +37,8 @@ class Exp_Main(Exp_Basic):
         super(Exp_Main, self).__init__(args)
 
     def _build_model(self):
-        # --- DDP init ---
-        if self.args.use_multi_gpu and self.args.use_gpu:
-            if not is_ddp():
-                dist.init_process_group(
-                    backend="nccl",
-                    init_method="env://",
-                    timeout=timedelta(seconds=300)
-                )
-            local_rank = int(os.environ["LOCAL_RANK"])
-            torch.cuda.set_device(local_rank)
-            self.device = torch.device("cuda", local_rank)
-            self.rank = dist.get_rank()
-        else:
-            self.device = torch.device("cuda" if self.args.use_gpu else "cpu")
-            self.rank = 0
+        self.device = torch.device("cuda" if self.args.use_gpu else "cpu")
+        self.rank = 0
 
         if self.args.model == 'AdaMamba':
             # kernels parse
@@ -90,18 +74,6 @@ class Exp_Main(Exp_Basic):
 
         model = model_dict[self.args.model].Model(self.args).float().to(self.device)
 
-        if self.args.use_multi_gpu and self.args.use_gpu:
-            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-            model = nn.parallel.DistributedDataParallel(
-                model,
-                device_ids=[self.device.index],
-                output_device=self.device.index,
-                find_unused_parameters=True,
-                broadcast_buffers=False,
-            )
-            if self.rank == 0:
-                print(f"[DDP] rank {self.rank}, local_rank {int(os.environ['LOCAL_RANK'])} -> device {self.device}")
-
         return model
 
     def _get_data(self, flag):
@@ -120,6 +92,14 @@ class Exp_Main(Exp_Basic):
 
     def vali(self, vali_loader, criterion, epoch, data="val"):
         total_loss = []
+        loss_components = None
+        if self.args.model == "AdaMamba":
+            loss_components = {
+                'huber': [],
+                'quantile': [],
+                'trend': [],
+                'total': [],
+            }
         preds, trues = [], []
         predictions_on_cpu = []
 
@@ -127,7 +107,7 @@ class Exp_Main(Exp_Basic):
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(tqdm(vali_loader, desc="Validation")):
                 batch_x = batch_x.float().to(self.device)
-                batch_y = batch_y.float()
+                batch_y = batch_y.float().to(self.device)
 
                 batch_x_mark = batch_x_mark.float().to(self.device)
                 batch_y_mark = batch_y_mark.float().to(self.device)
@@ -139,7 +119,11 @@ class Exp_Main(Exp_Basic):
                 y = batch_y[:, -self.pred_len:, f_dim:]
 
                 if self.args.model == "AdaMamba":
+                    total_loss_value, batch_loss_components = unwrap_model(self.model).compute_loss(batch_x, y)
                     outputs, _ = self._sample_adamamba(batch_x)
+                    total_loss.append(total_loss_value.item())
+                    for key in loss_components:
+                        loss_components[key].append(batch_loss_components[key].item())
                 else:
                     if 'Linear' in self.args.model or 'TST' in self.args.model or 'MambaTS' in self.args.model:
                         outputs = self.model(batch_x)
@@ -155,8 +139,9 @@ class Exp_Main(Exp_Basic):
                 true = y.detach().cpu()
                 preds.append(pred); trues.append(true)
 
-                loss = criterion(pred, true)
-                total_loss.append(loss)
+                if self.args.model != "AdaMamba":
+                    loss = criterion(outputs, y)
+                    total_loss.append(loss.item())
 
         preds = np.array(preds)
         trues = np.array(trues)
@@ -166,9 +151,15 @@ class Exp_Main(Exp_Basic):
 
         mae, mse, rmse, mape, mspe, rse, corr = metric(preds, trues)
         total_loss = np.average(total_loss)
+        avg_loss_components = None
+        if loss_components is not None:
+            avg_loss_components = {
+                key: float(np.average(values)) if len(values) > 0 else 0.0
+                for key, values in loss_components.items()
+            }
 
         self.model.train()
-        return total_loss, mae, mse, rmse, mape, mspe, rse, corr
+        return total_loss, avg_loss_components, mae, mse, rmse, mape, mspe, rse, corr
 
     def train(self, setting):
         self.model.train()
@@ -185,6 +176,14 @@ class Exp_Main(Exp_Basic):
 
         for epoch in range(self.args.train_epochs):
             train_loss = []
+            train_loss_components = None
+            if self.args.model == "AdaMamba":
+                train_loss_components = {
+                    'huber': [],
+                    'quantile': [],
+                    'trend': [],
+                    'total': [],
+                }
             sampler.set_epoch(epoch) if sampler is not None else None
             epoch_start_time = time.time()
 
@@ -216,39 +215,74 @@ class Exp_Main(Exp_Basic):
                     outputs = outputs[:, -self.pred_len:, f_dim:]
                     loss = criterion(outputs, y)
                     loss.backward()
+                    if getattr(self.args, "grad_clip", 0.0) and self.args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                     model_optim.step()
                     train_loss.append(loss.item())
 
                 else:
-                    total_loss = self.model(batch_x, y)
+                    total_loss, loss_components = self.model(batch_x, y, return_components=True)
                     total_loss.backward()
+                    if getattr(self.args, "grad_clip", 0.0) and self.args.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                     model_optim.step()
                     train_loss.append(total_loss.item())
+                    for key in train_loss_components:
+                        train_loss_components[key].append(loss_components[key].item())
 
             train_loss = np.average(train_loss)
+            avg_train_loss_components = None
+            if train_loss_components is not None:
+                avg_train_loss_components = {
+                    key: float(np.average(values)) if len(values) > 0 else 0.0
+                    for key, values in train_loss_components.items()
+                }
             epoch_end_time = time.time()
 
-            vali_loss, *_ = self.vali(vali_loader, criterion, epoch, "val")
-            test_loss, *_ = self.vali(test_loader, criterion, epoch, "test")
+            vali_loss, val_loss_components, *_ = self.vali(vali_loader, criterion, epoch, "val")
+            test_loss, test_loss_components, *_ = self.vali(test_loader, criterion, epoch, "test")
 
-            if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
+            if (
+                avg_train_loss_components is not None
+                and val_loss_components is not None
+                and test_loss_components is not None
+            ):
+                print(
+                    "[RANK {}] Epoch: {} cost time: {:.2f} | "
+                    "Train Total: {:.6f}, Huber: {:.6f}, Quantile: {:.6f}, Trend: {:.6f} | "
+                    "Val Total: {:.6f}, Huber: {:.6f}, Quantile: {:.6f}, Trend: {:.6f} | "
+                    "Test Total: {:.6f}, Huber: {:.6f}, Quantile: {:.6f}, Trend: {:.6f}".format(
+                        self.rank,
+                        epoch + 1,
+                        epoch_end_time - epoch_start_time,
+                        avg_train_loss_components['total'],
+                        avg_train_loss_components['huber'],
+                        avg_train_loss_components['quantile'],
+                        avg_train_loss_components['trend'],
+                        val_loss_components['total'],
+                        val_loss_components['huber'],
+                        val_loss_components['quantile'],
+                        val_loss_components['trend'],
+                        test_loss_components['total'],
+                        test_loss_components['huber'],
+                        test_loss_components['quantile'],
+                        test_loss_components['trend'],
+                    )
+                )
+            else:
                 print("[RANK {}] Epoch: {} cost time: {:.2f} | Train: {:.6f}, Val: {:.6f}, Test: {:.6f}".format(
                     self.rank, epoch + 1, epoch_end_time - epoch_start_time, train_loss, vali_loss, test_loss))
             
             early_stopping(vali_loss, test_loss, self.model, path)
             if early_stopping.early_stop:
-                if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
-                    print("Early stopping")
+                print("Early stopping")
                 break
             if math.isnan(train_loss):
-                if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
-                    print("NaN detected, stopping training.")
+                print("NaN detected, stopping training.")
                 return self.model
 
         # ✅ best ckpt load (CPU)
         best_model_path = os.path.join(path, "checkpoint.pth")
-        if self.args.use_multi_gpu:
-            dist.barrier()
         state = torch.load(best_model_path, map_location="cpu")
         try:
             unwrap_model(self.model).load_state_dict(state, strict=True)
@@ -261,35 +295,24 @@ class Exp_Main(Exp_Basic):
                 "checkpoint directory before rerunning.\n"
                 f"Original error:\n{exc}"
             ) from exc
-        if self.args.use_multi_gpu:
-            dist.barrier()
-
         return self.model
 
     def test(self, setting, test=0):
         self.model.eval()
         test_data, test_loader, _ = self._get_data(flag='test')
 
-        if self.args.use_multi_gpu:
-            dist.barrier()
-
         if test:
-            if self.args.use_multi_gpu:
-                dist.barrier()
             ckpt_path = os.path.join("./checkpoints", setting, "checkpoint.pth")
             state_dict = torch.load(ckpt_path, map_location="cpu")
             unwrap_model(self.model).load_state_dict(state_dict, strict=True)
-            if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
-                print("loading model")
-            if self.args.use_multi_gpu:
-                dist.barrier()
+            print("loading model")
 
         preds, trues, inputx = [], [], []
         folder_path = './test_results/' + setting + '/'
         os.makedirs(folder_path, exist_ok=True)
 
         # ✅ DDP면 시각화/파일저장은 rank0만
-        do_viz = (not self.args.use_multi_gpu) or (self.rank == 0)
+        do_viz = True
 
         with torch.no_grad():
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(tqdm(test_loader, desc="Test")):
@@ -326,9 +349,6 @@ class Exp_Main(Exp_Basic):
                 trues.append(y_np)
                 inputx.append(batch_x.detach().cpu().numpy())
 
-                if self.args.use_multi_gpu:
-                    dist.barrier()
-
                 # -------------------------
                 # ✅ 시각화 (rank0 only)
                 # -------------------------
@@ -350,13 +370,8 @@ class Exp_Main(Exp_Basic):
                     if true_tensor.dtype != input_tensor.dtype:
                         true_tensor = true_tensor.to(input_tensor.dtype)
 
-                    gt_seq = torch.cat([input_tensor, true_tensor], dim=1)  # (B,L+P,D)
-
-                    k_size = getattr(self.args, 'moving_avg', 25)
-                    if isinstance(k_size, list):
-                        k_size = k_size[0]
-
-                    gt_trend = moving_average(gt_seq, kernel_size=k_size)
+                    model_ref = unwrap_model(self.model)
+                    _, gt_trend = model_ref.get_trend_targets(input_tensor, true_tensor)
 
                     # batch_trend가 torch가 아닐 수도 있어서 안전 처리
                     if isinstance(batch_trend, np.ndarray):
@@ -367,26 +382,29 @@ class Exp_Main(Exp_Basic):
                     # Compare on the same forecast horizon window.
                     # batch_trend_t is already forecast trend [B, pred_len, D].
                     t_len = min(true_tensor.shape[1], batch_trend_t.shape[1])
-                    gt_trend_forecast = gt_trend[:, -t_len:, :]
+                    gt_trend_forecast = gt_trend[:, :t_len, :]
                     raw_forecast = true_tensor[:, :t_len, :]
                     pred_trend_forecast = batch_trend_t[:, :t_len, :]
 
                     gt_trend_np = gt_trend_forecast[0, :, -1].detach().cpu().numpy()
                     pred_trend_np = pred_trend_forecast[0, :, -1].detach().cpu().numpy()
                     raw_data_np = raw_forecast[0, :, -1].detach().cpu().numpy()
-                    try:
-                        visual_trend(
-                            gt_trend_np, pred_trend_np, raw_data_np,
-                            name=os.path.join(folder_path, f"trend_comparison_{i}.pdf")
-                        )
+                    pred_forecast_np = outputs[0, :t_len, -1].detach().cpu().numpy()
+                    input_history_np = input_tensor[0, :, -1].detach().cpu().numpy()
+                    if self.args.norm_type == "AdaNorm" and self.args.model == "AdaMamba":
+                        try:
+                            visual_trend(
+                                gt_trend_np,
+                                pred_trend_np,
+                                raw_data_np,
+                                true_forecast=raw_data_np,
+                                pred_forecast=pred_forecast_np,
+                                input_history=input_history_np,
+                                name=os.path.join(folder_path, f"trend_comparison_{i}.pdf")
+                            )
 
-                        # ✅ 이 함수도 내부에서 rank0 체크하고 있긴 한데, 밖에서 한 번 더 막음
-                        self.visualize_kernel_weights(
-                            self.model, test_loader, self.device, kernels=self.args.kernels,
-                            save_path=os.path.join(folder_path, f"kernel_weights_{i}.pdf")
-                        )
-                    except Exception as e:
-                        print(f"Visualization error at batch {i}: {e}")
+                        except Exception as e:
+                            print(f"Visualization error at batch {i}: {e}")
 
 
         if self.args.test_flop:
@@ -398,12 +416,11 @@ class Exp_Main(Exp_Basic):
         trues = np.array(trues).reshape(-1, trues[0].shape[-2], trues[0].shape[-1])
         inputx = np.array(inputx).reshape(-1, inputx[0].shape[-2], inputx[0].shape[-1])
 
-        if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
-            mae, mse, rmse, mape, mspe, rse, _ = metric(preds, trues)
-            print(f'mae:{mae}, mse:{mse}, rmse:{rmse}, mape:{mape}, mspe:{mspe}, rse:{rse}')
-            with open("result.txt", "a") as f:
-                f.write(setting + "\n")
-                f.write(f'mae:{mae}, mse:{mse}, rmse:{rmse}, mape:{mape}, mspe:{mspe}, rse:{rse}\n\n')
+        mae, mse, rmse, mape, mspe, rse, _ = metric(preds, trues)
+        print(f'mae:{mae}, mse:{mse}, rmse:{rmse}, mape:{mape}, mspe:{mspe}, rse:{rse}')
+        with open("result.txt", "a") as f:
+            f.write(setting + "\n")
+            f.write(f'mae:{mae}, mse:{mse}, rmse:{rmse}, mape:{mape}, mspe:{mspe}, rse:{rse}\n\n')
 
         return
 
@@ -453,17 +470,12 @@ class Exp_Main(Exp_Basic):
         folder_path = './results/' + setting + '/'
         os.makedirs(folder_path, exist_ok=True)
 
-        if (self.args.use_multi_gpu and self.rank == 0) or not self.args.use_multi_gpu:
-            np.save(folder_path + 'real_prediction.npy', preds)
+        np.save(folder_path + 'real_prediction.npy', preds)
 
         return
 
     def analysis_batch(self, batch_x, setting):
         # DDP면 rank0만 저장 (중복 저장 방지)
-        if is_ddp():
-            if dist.get_rank() != 0:
-                return
-
         # 1) 내부 모델 언랩
         model_engine = self.model
         while hasattr(model_engine, 'module'):
@@ -554,11 +566,6 @@ class Exp_Main(Exp_Basic):
         plt.close()
         print(f">>> Fast Spectral Analysis Saved to: {save_path}")
 
-        # (옵션) alpha_gate 로그
-        if alpha_gate is not None:
-            a = alpha_gate.detach().cpu().numpy().squeeze()  # [M] 또는 scalar
-            print(f">>> [Analysis] alpha_gate (mean/min/max): {a.mean():.4f}/{a.min():.4f}/{a.max():.4f}")
-
     def visualize_kernel_weights(
         self,
         model,
@@ -575,14 +582,7 @@ class Exp_Main(Exp_Basic):
         """
 
         # -----------------------------
-        # 0) DDP면 rank0만 저장/시각화
-        # -----------------------------
-        if dist.is_available() and dist.is_initialized():
-            if dist.get_rank() != 0:
-                return None
-
-        # -----------------------------
-        # 1) 모델 언랩 (DDP/DataParallel 대응)
+        # 0) 모델 언랩 (DDP/DataParallel 대응)
         # -----------------------------
         model_engine = model
         while hasattr(model_engine, 'module'):
@@ -591,7 +591,7 @@ class Exp_Main(Exp_Basic):
         model_engine.eval()
 
         # -----------------------------
-        # 2) kernel attention 모듈 찾기
+        # 1) kernel attention 모듈 찾기
         # -----------------------------
         target_module = None
         target_kind = None
@@ -685,7 +685,3 @@ class Exp_Main(Exp_Basic):
         print(f"Visualization saved to {save_path}")
 
         return avg_weights
-
-    if is_ddp():
-        dist.barrier()
-        dist.destroy_process_group()

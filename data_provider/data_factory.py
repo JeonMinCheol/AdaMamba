@@ -1,6 +1,5 @@
 from data_provider.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_Pred
-from torch.utils.data import DataLoader, DistributedSampler
-import torch
+from torch.utils.data import DataLoader
 
 data_dict = {
     'ETTh1': Dataset_ETT_hour,
@@ -43,12 +42,7 @@ def data_provider(args, flag):
         freq=freq
     )
 
-    # --- DDP sampler 설정 ---
-    sampler = DistributedSampler(
-        data_set,
-        shuffle=True, 
-        drop_last=True
-    ) if args.use_gpu else None
+    sampler = None
 
     print(f"[Data] {flag} set size: {len(data_set)}")
 

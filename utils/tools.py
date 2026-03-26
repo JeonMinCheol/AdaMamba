@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import csv, os
 import seaborn as sns
-import torch.distributed as dist
 
 import io
 from PIL import Image
@@ -24,37 +23,17 @@ class EarlyStopping:
         self.delta = delta
 
     def __call__(self, val_loss, test_loss, model, path):
-        if not dist.is_initialized():
-            # Single GPU fallback
-            return self._update(val_loss, model, path)
+        return self._update(val_loss, test_loss, model, path)
 
-        # 1) 모든 프로세스의 val_loss 모으기
-        device = next(model.parameters()).device
-        tensor_loss = torch.tensor([val_loss], dtype=torch.float32, device=device)
-        all_losses = [torch.zeros_like(tensor_loss) for _ in range(dist.get_world_size())]
-        dist.all_gather(all_losses, tensor_loss)
-        all_losses = [t.item() for t in all_losses]
-
-        # 2) 현재 스텝에서 가장 낮은 val_loss 가진 rank 찾기
-        best_rank = min(range(len(all_losses)), key=lambda r: all_losses[r])
-        best_val_loss = all_losses[best_rank]
-
-        # 3) 기존 best_loss보다 더 좋아야만 저장
-        if best_val_loss + self.delta < self.val_loss_min:
-            if dist.get_rank() == best_rank:
-                self.save_checkpoint(best_val_loss, test_loss, model, path, best_rank)
-            dist.barrier() 
-            self.val_loss_min = best_val_loss
+    def _update(self, val_loss, test_loss, model, path):
+        if val_loss + self.delta < self.val_loss_min:
+            self.save_checkpoint(val_loss, test_loss, model, path, rank=0)
+            self.val_loss_min = val_loss
             self.counter = 0
         else:
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-
-        # 4) early_stop 상태 동기화
-        flag = torch.tensor(1 if self.early_stop else 0, device=device)
-        dist.broadcast(flag, src=best_rank)
-        self.early_stop = flag.item() == 1
 
     def save_checkpoint(self, val_loss, test_loss, model, path, rank):
         if self.verbose:
@@ -272,27 +251,91 @@ def get_heatmap_image_tensor(attention_weights, sample_num=0, head_num=0):
 
     return img_tensor
 
-def visual_trend(true_trend, pred_trend, raw_data=None, name='./trend_test.pdf'):
+def visual_trend(
+    true_trend,
+    pred_trend,
+    raw_data=None,
+    true_forecast=None,
+    pred_forecast=None,
+    input_history=None,
+    name='./trend_test.pdf',
+):
     """
-    true_trend: (L, ) or (L, 1) - 실제 트렌드 (Moving Average 등)
-    pred_trend: (L, ) or (L, 1) - 모델이 추출한 트렌드
+    true_trend: (L, ) or (L, 1) - 학습/평가 기준이 되는 참조 트렌드
+    pred_trend: (L, ) or (L, 1) - 모델이 예측한 forecast 구간 트렌드
     raw_data: (L, ) or (L, 1) - 원본 시계열 데이터 (선택 사항)
+    true_forecast: (L, ) - 예측 구간 실제값
+    pred_forecast: (L, ) - 예측 구간 예측값
+    input_history: (L, ) - 입력 히스토리
     """
-    plt.figure(figsize=(10, 4))
+    has_forecast_panel = true_forecast is not None or pred_forecast is not None
+    fig, axes = plt.subplots(2 if has_forecast_panel else 1, 1, figsize=(10, 7 if has_forecast_panel else 4))
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+
+    trend_ax = axes[0]
     if raw_data is not None:
-        plt.plot(raw_data, label='Raw Data', color='gray', linewidth=0.8, alpha=0.3)
-    
-    plt.plot(true_trend, label='Actual Trend (MA)', color='blue', linewidth=1.5, alpha=0.8)
-    plt.plot(pred_trend, label='Model Extracted Trend', color='red', linewidth=1.5, linestyle='--', alpha=0.8)
-    
-    plt.title("Trend Comparison", fontsize=12)
-    plt.xlabel("Time", fontsize=10)
-    plt.ylabel("Value", fontsize=10)
-    plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
-    plt.legend(fontsize=10)
-    plt.tight_layout()
-    plt.savefig(name, bbox_inches='tight', dpi=300)
-    plt.close()
+        trend_ax.plot(raw_data, label='Raw Forecast', color='gray', linewidth=0.8, alpha=0.3)
+
+    trend_ax.plot(true_trend, label='Reference Trend', color='blue', linewidth=1.5, alpha=0.8)
+    trend_ax.plot(pred_trend, label='Predicted Trend', color='red', linewidth=1.5, linestyle='--', alpha=0.8)
+    trend_ax.set_title("Trend Comparison", fontsize=12)
+    trend_ax.set_xlabel("Time", fontsize=10)
+    trend_ax.set_ylabel("Value", fontsize=10)
+    trend_ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
+    trend_ax.legend(fontsize=10)
+
+    if has_forecast_panel:
+        forecast_ax = axes[1]
+        if input_history is not None:
+            hist_x = np.arange(len(input_history))
+            forecast_ax.plot(
+                hist_x,
+                input_history,
+                label='Input History',
+                color='gray',
+                linewidth=1.0,
+                alpha=0.6,
+            )
+
+        if true_forecast is not None:
+            start_idx = len(input_history) if input_history is not None else 0
+            future_x = np.arange(start_idx, start_idx + len(true_forecast))
+            forecast_ax.plot(
+                future_x,
+                true_forecast,
+                label='Ground Truth Forecast',
+                color='blue',
+                linewidth=1.5,
+                alpha=0.85,
+            )
+
+        if pred_forecast is not None:
+            start_idx = len(input_history) if input_history is not None else 0
+            future_x = np.arange(start_idx, start_idx + len(pred_forecast))
+            forecast_ax.plot(
+                future_x,
+                pred_forecast,
+                label='Predicted Forecast',
+                color='red',
+                linewidth=1.2,
+                linestyle='--',
+                alpha=0.85,
+            )
+
+        if input_history is not None:
+            split_x = len(input_history) - 1
+            forecast_ax.axvline(split_x, color='black', linestyle=':', linewidth=1.0, alpha=0.6)
+
+        forecast_ax.set_title("Forecast Comparison", fontsize=12)
+        forecast_ax.set_xlabel("Time", fontsize=10)
+        forecast_ax.set_ylabel("Value", fontsize=10)
+        forecast_ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.7)
+        forecast_ax.legend(fontsize=10)
+
+    fig.tight_layout()
+    fig.savefig(name, bbox_inches='tight', dpi=300)
+    plt.close(fig)
 
 def moving_average(data, kernel_size=25):
     """

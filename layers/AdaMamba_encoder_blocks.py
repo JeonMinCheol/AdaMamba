@@ -42,4 +42,4 @@ class ContextEncoder(nn.Module):
         
         summary_context = self.attention_pool(x_patched)
 
-        return summary_context
+        return summary_context, x_patched

@@ -4,7 +4,7 @@ import torch
 class Exp_Basic(object):
     def __init__(self, args):
         self.args = args
-        self.rank = int(os.environ.get("RANK", 0)) if self.args.use_multi_gpu and self.args.use_gpu else 0
+        self.rank = 0
         self.device = self._acquire_device()
         self.model = self._build_model().to(self.device)
         self.pred_len = args.pred_len
@@ -14,9 +14,9 @@ class Exp_Basic(object):
 
     def _acquire_device(self):
         if self.args.use_gpu:
-            local_rank = int(os.environ.get('LOCAL_RANK', 0))
-            device = torch.device('cuda:{}'.format(local_rank))
-            print('Use GPU: cuda:{}'.format(local_rank))
+            gpu_index = int(getattr(self.args, 'gpu', 0))
+            device = torch.device('cuda:{}'.format(gpu_index))
+            print('Use GPU: cuda:{}'.format(gpu_index))
         else:
             device = torch.device('cpu')
             print('Use CPU')

@@ -15,19 +15,92 @@ class PredictionHead(nn.Module):
     def __init__(self, configs):
         super().__init__()
         self.pred_len = configs.pred_len
-        d_model = configs.d_ff
+        d_model = configs.d_model
         d_inner = configs.d_head
-        self.mlp = nn.Sequential(
+        self.summary_head = nn.Sequential(
             nn.LayerNorm(d_model),
             nn.Linear(d_model, d_inner),
             nn.GELU(),
             nn.Dropout(configs.head_dropout),
             nn.Linear(d_inner, self.pred_len)
         )
+        self.num_patches = max(1, (configs.seq_len - configs.patch_len) // configs.stride + 1)
+        self.token_mixer = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_inner),
+            nn.GELU(),
+            nn.Dropout(configs.head_dropout),
+            nn.Linear(d_inner, d_model),
+            nn.GELU(),
+        )
+        self.patch_to_horizon = nn.Linear(self.num_patches, self.pred_len)
+        self.horizon_norm = nn.LayerNorm(d_model)
+        self.summary_to_token = nn.Linear(d_model, d_model)
+        self.token_out = nn.Linear(d_model, 1)
+        self._init_token_residual_branch()
 
-    def forward(self, summary_context):
-        output = self.mlp(summary_context)
+    def _init_token_residual_branch(self):
+        with torch.no_grad():
+            self.token_out.weight.zero_()
+            self.token_out.bias.zero_()
+
+    def forward(self, summary_context, encoded_tokens):
+        output = self.summary_head(summary_context)
+
+        token_features = self.token_mixer(encoded_tokens)
+        horizon_features = self.patch_to_horizon(
+            token_features.transpose(1, 2)
+        ).transpose(1, 2)
+        summary_bias = self.summary_to_token(summary_context).unsqueeze(1)
+        token_residual = self.token_out(
+            self.horizon_norm(horizon_features + summary_bias)
+        ).squeeze(-1)
+        output = output + token_residual
         return output.view(-1, self.pred_len, 1)
+
+
+class FutureTrendHead(nn.Module):
+    def __init__(self, configs):
+        super().__init__()
+        self.seq_len = configs.seq_len
+        self.pred_len = configs.pred_len
+        hidden_dim = min(max(self.seq_len, self.pred_len), 512)
+
+        self.base_proj = nn.Linear(self.seq_len, self.pred_len)
+        self.residual_proj = nn.Sequential(
+            nn.LayerNorm(self.seq_len),
+            nn.Linear(self.seq_len, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(configs.head_dropout),
+            nn.Linear(hidden_dim, self.pred_len),
+        )
+        self._init_base_projection()
+        self._init_residual_projection()
+
+    def _init_base_projection(self):
+        with torch.no_grad():
+            self.base_proj.weight.zero_()
+            self.base_proj.bias.zero_()
+
+            if self.pred_len <= self.seq_len:
+                start = self.seq_len - self.pred_len
+                indices = torch.arange(self.pred_len)
+                self.base_proj.weight[indices, start + indices] = 1.0
+            else:
+                self.base_proj.weight.fill_(1.0 / self.seq_len)
+
+    def _init_residual_projection(self):
+        with torch.no_grad():
+            last_linear = self.residual_proj[-1]
+            last_linear.weight.zero_()
+            last_linear.bias.zero_()
+
+    def forward(self, trend):
+        trend_tokens = trend.permute(0, 2, 1)  # [B, M, L]
+        base = self.base_proj(trend_tokens)
+        residual = self.residual_proj(trend_tokens)
+        forecast_trend = base + residual
+        return forecast_trend.permute(0, 2, 1).contiguous()  # [B, pred_len, M]
 
 class Model(nn.Module):
     def __init__(self, configs):
@@ -40,16 +113,12 @@ class Model(nn.Module):
         self.lambda_h_loss = configs.lambda_h_loss
         self.lambda_q_loss = configs.lambda_q_loss
         self.lambda_trend_loss = getattr(configs, "lambda_trend_loss", 0.0)
+        self.trend_loss_mode = getattr(configs, "trend_loss_mode", "smooth_l1")
+        self.trend_target_mode = getattr(configs, "trend_target_mode", "extractor")
+        self.residual_target_mode = getattr(configs, "residual_target_mode", "forecast")
         self.norm_type = configs.norm_type
         self.use_trend_forecast = configs.use_trend_forecast
-        self.use_encoder_input_mask = getattr(configs, "use_encoder_input_mask", False)
-        self.encoder_mask_ratio = getattr(configs, "encoder_mask_ratio", 0.0)
-        self.encoder_mask_block = max(
-            1, int(getattr(configs, "encoder_mask_block", getattr(configs, "patch_len", 1)))
-        )
-        self.encoder_mask_keep_last = max(
-            0, int(getattr(configs, "encoder_mask_keep_last", getattr(configs, "patch_len", 0)))
-        )
+        
         if self.norm_type == 'AdaNorm':
             self.adaptive_norm_block = AdaptiveNormalizationBlock(configs)
         elif self.norm_type == 'RevIN':
@@ -66,26 +135,13 @@ class Model(nn.Module):
         self.mean_head = PredictionHead(configs)
         self.trend_gate_feature_dim = 4
         self.trend_subtract_gate = nn.Linear(self.trend_gate_feature_dim, 1)
-        self.trend_proj = nn.Linear(self.seq_len, self.pred_len)
+        self.trend_proj = FutureTrendHead(configs)
         self._init_trend_subtract_gate()
-        self._init_trend_projection()
 
     def _init_trend_subtract_gate(self):
         with torch.no_grad():
             self.trend_subtract_gate.weight.zero_()
             self.trend_subtract_gate.bias.fill_(-2.0)
-
-    def _init_trend_projection(self):
-        with torch.no_grad():
-            self.trend_proj.weight.zero_()
-            self.trend_proj.bias.zero_()
-
-            if self.pred_len <= self.seq_len:
-                start = self.seq_len - self.pred_len
-                indices = torch.arange(self.pred_len)
-                self.trend_proj.weight[indices, start + indices] = 1.0
-            else:
-                self.trend_proj.weight.fill_(1.0 / self.seq_len)
 
     def flatten_series(self, x):
         B, L, M = x.shape  # x: [B, L, M]
@@ -170,17 +226,67 @@ class Model(nn.Module):
             return torch.zeros(
                 bsz, self.pred_len, n_vars, device=trend.device, dtype=trend.dtype
             )  # [B, pred_len, M]
-        
-        trend_tokens = trend.permute(0, 2, 1)  # [B, M, L]
-        projected_trend = self.trend_proj(trend_tokens)  # [B, M, pred_len]
-        return projected_trend.permute(0, 2, 1).contiguous()  # [B, pred_len, M]
 
-    def forward(self, x_enc, y):
+        return self.trend_proj(trend)  # [B, pred_len, M]
+
+    def get_trend_targets(self, x_enc, y):
+        input_trend_target = self.adaptive_norm_block.moving_average_trend(x_enc).detach()
+        full_seq = torch.cat([x_enc, y], dim=1)
+        full_trend_target = self.adaptive_norm_block.moving_average_trend(full_seq).detach()
+        future_trend_target = full_trend_target[:, -self.pred_len:, :]
+        return input_trend_target, future_trend_target
+
+    def needs_teacher_trend_targets(self):
+        return self.norm_type == 'AdaNorm' and (
+            self.residual_target_mode == 'teacher'
+            or (self.use_trend_forecast and self.lambda_trend_loss > 0)
+        )
+
+    def get_residual_target_trend(self, y, trend_for_forecast, future_trend_target=None):
+        if not self.use_trend_forecast:
+            return torch.zeros_like(y)
+
+        if future_trend_target is not None:
+            return future_trend_target
+        return trend_for_forecast.detach()
+
+    def compute_trend_alignment_loss(self, pred_trend, target_trend):
+        if self.trend_loss_mode == 'smooth_l1':
+            return F.smooth_l1_loss(pred_trend, target_trend)
+
+        pred_centered = pred_trend - pred_trend.mean(dim=1, keepdim=True)
+        target_centered = target_trend - target_trend.mean(dim=1, keepdim=True)
+        scale = torch.sqrt(
+            torch.var(target_centered, dim=1, keepdim=True, unbiased=False) + 1e-5
+        )
+        level_loss = F.smooth_l1_loss(pred_centered / scale, target_centered / scale)
+
+        if self.trend_loss_mode == 'normalized_smooth_l1':
+            return level_loss
+
+        if pred_trend.size(1) < 2 or target_trend.size(1) < 2:
+            return level_loss
+
+        pred_diff = pred_trend[:, 1:, :] - pred_trend[:, :-1, :]
+        target_diff = target_trend[:, 1:, :] - target_trend[:, :-1, :]
+        diff_scale = torch.sqrt(
+            torch.var(target_diff, dim=1, keepdim=True, unbiased=False) + 1e-5
+        )
+        diff_loss = F.smooth_l1_loss(pred_diff / diff_scale, target_diff / diff_scale)
+
+        if self.trend_loss_mode == 'diff_smooth_l1':
+            return diff_loss
+        if self.trend_loss_mode == 'hybrid':
+            return 0.5 * (level_loss + diff_loss)
+
+        raise ValueError(f"Unsupported trend_loss_mode: {self.trend_loss_mode}")
+
+    def compute_loss(self, x_enc, y):
         """
         x_enc:   [B, L, M]
         y_true:  [B, pred_len, M]
         """
-        B, L, M = x_enc.shape
+        B, _, M = x_enc.shape
 
         # ============================================================
         # 1) Normalize + Trend extraction
@@ -191,40 +297,48 @@ class Model(nn.Module):
         # ============================================================
         # 3) Encoder + Head
         # ============================================================
-        summary_context = self.encoder(normalized_x)  # [B*M, d_ff]
-        mean_pred_norm = self.mean_head(summary_context)  # [B*M, pred_len, 1]
+        summary_context, encoded_tokens = self.encoder(normalized_x)  # [B*M, d_ff], [B*M, N, d_ff]
+        mean_pred_norm = self.mean_head(summary_context, encoded_tokens)  # [B*M, pred_len, 1]
+        mean_pred = mean_pred_norm.reshape(B, M, self.pred_len).permute(0, 2, 1)  # [B, pred_len, M]
 
         # ============================================================
-        # 4) y_true detrend + normalize (loss용)
+        # 4) De-normalize residual forecast and compose final forecast
         # ============================================================
-        y_true_detrended = y - trend_for_forecast  # [B, pred_len, M]
-        y_true_detrended_series = self.flatten_series(y_true_detrended)  # [B*M, pred_len, 1]
-
-        if self.norm_type == 'None':
-            normalized_y_true = y_true_detrended_series
-        elif self.norm_type == 'AdaNorm':
-            normalized_y_true = self.adaptive_norm_block.apply_normalization(
-                y_true_detrended, means, stdev
-            )  # [B, pred_len, M]
-            normalized_y_true = self.flatten_series(normalized_y_true)  # [B*M, pred_len, 1]
-        else:
-            normalized_y_true = (y_true_detrended_series - means_series) / stdev_series  # [B*M, pred_len, 1]
+        residual_forecast = mean_pred * stdev + means  # [B, pred_len, M]
+        final_forecast = residual_forecast + trend_for_forecast  # [B, pred_len, M]
 
         # ============================================================
         # 5) Loss
         # ============================================================
-        huber = F.smooth_l1_loss(mean_pred_norm, normalized_y_true)
-        q10 = quantile_loss(mean_pred_norm, normalized_y_true, 0.1)
-        q90 = quantile_loss(mean_pred_norm, normalized_y_true, 0.9)
-        mean_loss = self.lambda_h_loss * huber + self.lambda_q_loss * (q10 + q90)
-        trend_loss = 0.0
+        huber = F.smooth_l1_loss(final_forecast, y)
+        q10 = quantile_loss(final_forecast, y, 0.1)
+        q90 = quantile_loss(final_forecast, y, 0.9)
+        quantile = q10 + q90
+        trend_loss = torch.zeros((), device=huber.device, dtype=huber.dtype)
 
         if self.norm_type == 'AdaNorm' and self.use_trend_forecast and self.lambda_trend_loss > 0:
             with torch.no_grad():
-                future_trend_target = self.adaptive_norm_block.extract_trend(y).detach()  # [B, pred_len, M]
-            trend_loss = F.smooth_l1_loss(trend_for_forecast, future_trend_target)
+                future_trend_target = self.adaptive_norm_block.extract_trend(y).detach()
+            trend_loss = self.compute_trend_alignment_loss(trend_for_forecast, future_trend_target)
 
-        return mean_loss + self.lambda_trend_loss * trend_loss
+        huber_component = self.lambda_h_loss * huber
+        quantile_component = self.lambda_q_loss * quantile
+        trend_component = self.lambda_trend_loss * trend_loss
+        total_loss = huber_component + quantile_component + trend_component
+
+        loss_components = {
+            'huber': huber_component.detach(),
+            'quantile': quantile_component.detach(),
+            'trend': trend_component.detach(),
+            'total': total_loss.detach(),
+        }
+        return total_loss, loss_components
+
+    def forward(self, x_enc, y, return_components=False):
+        total_loss, loss_components = self.compute_loss(x_enc, y)
+        if return_components:
+            return total_loss, loss_components
+        return total_loss
 
     def sample(self, x_enc):
         self.eval()
@@ -240,8 +354,8 @@ class Model(nn.Module):
             # ============================================================
             # 3) Encoder + Head
             # ============================================================
-            summary_context = self.encoder(normalized_x)  # [B*M, d_ff]
-            mean_pred_norm = self.mean_head(summary_context)  # [B*M, pred_len, 1]
+            summary_context, encoded_tokens = self.encoder(normalized_x)  # [B*M, d_ff], [B*M, N, d_ff]
+            mean_pred_norm = self.mean_head(summary_context, encoded_tokens)  # [B*M, pred_len, 1]
             mean_pred_norm = mean_pred_norm.reshape(B, M, self.pred_len).permute(0, 2, 1)  # [B, pred_len, M]
 
             # ============================================================

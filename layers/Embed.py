@@ -18,7 +18,7 @@ class PatchingEmbedding(nn.Module):
         # 결과 shape: [B, C, Num_Patches, Patch_Len]
         x_unfolded = x.permute(0, 2, 1).unfold(dimension=-1, size=self.patch_len, step=self.stride)
         
-        # 2. ✅ [변경] 패치를 flatten하여 한번에 투영
+        # 2. 패치를 flatten하여 한번에 투영
         # [B, C, Num_Patches, Patch_Len] -> [B, Num_Patches, C, Patch_Len]
         x_patched = x_unfolded.permute(0, 2, 1, 3)
         

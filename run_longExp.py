@@ -1,7 +1,9 @@
 import argparse
 import os
+from utils.torch_compat import preload_ijit_stub
+
+preload_ijit_stub()
 import torch
-import torch.distributed as dist
 from exp.exp_main import Exp_Main
 import random
 import numpy as np
@@ -13,13 +15,6 @@ def setup_seed(seed):
     np.random.seed(seed)
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
-
-def cleanup_distributed():
-    if dist.is_available() and dist.is_initialized():
-        try:
-            dist.destroy_process_group()
-        except Exception:
-            pass
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Autoformer & Transformer family for Time Series Forecasting')
@@ -96,14 +91,42 @@ if __name__ == '__main__':
     # AdaMamba
     parser.add_argument('--d_head', type=int, default=2048)
     parser.add_argument('--n_hdim', type=int, default=16)
-    parser.add_argument('--reduction_ratio', type=int, default=4)
     parser.add_argument('--lambda_h_loss', type=float, default=1)
     parser.add_argument('--lambda_q_loss', type=float, default=1)
     parser.add_argument('--lambda_trend_loss', type=float, default=0.0)
+    parser.add_argument(
+        '--trend_loss_mode',
+        type=str,
+        default='smooth_l1',
+        choices=['smooth_l1', 'normalized_smooth_l1', 'diff_smooth_l1', 'hybrid'],
+        help='loss used to align predicted trend with the teacher trend',
+    )
+    parser.add_argument(
+        '--trend_target_mode',
+        type=str,
+        default='extractor',
+        choices=['extractor', 'moving_avg'],
+        help='teacher target for trend learning',
+    )
+    parser.add_argument(
+        '--residual_target_mode',
+        type=str,
+        default='forecast',
+        choices=['forecast', 'forecast_detach', 'teacher'],
+        help='trend source used to build the residual training target',
+    )
+    parser.add_argument(
+        '--trend_extractor_mode',
+        type=str,
+        default='sliding_conv',
+        choices=['sliding_conv'],
+        help='trend extractor backend (fixed to sliding_conv)',
+    )
     parser.add_argument('--kernels', type=str)
     parser.add_argument('--norm_type', type=str, default="AdaNorm", help='options: [AdaNorm, RevIN, None]')
     parser.add_argument('--use_dynamic', type=str2bool, default=False, help='whether to use dynamic kernel selection')
     parser.add_argument('--use_trend_forecast', type=str2bool, default=True, help='whether to add projected trend on forecast horizon')
+    parser.add_argument('--grad_clip', type=float, default=0.0, help='max gradient norm; set <=0 to disable')
     parser.add_argument(
         '--encoder_backbone',
         type=str,
@@ -179,7 +202,7 @@ if __name__ == '__main__':
     # GPU
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
     parser.add_argument('--gpu', type=int, default=0, help='gpu')
-    parser.add_argument('--use_multi_gpu', action='store_true', help='use multiple gpus', default=True)
+    parser.add_argument('--use_multi_gpu', action='store_true', help='deprecated: DDP is disabled in single-node mode', default=False)
     parser.add_argument('--devices', type=str, default='0,1,2,3', help='device ids of multile gpus')
     parser.add_argument('--test_flop', action='store_true', default=False, help='See utils/tools for usage')
 
@@ -189,12 +212,6 @@ if __name__ == '__main__':
     setup_seed(args.random_seed)
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
 
-    if args.use_gpu and args.use_multi_gpu:
-        args.dvices = args.devices.replace(' ', '')
-        device_ids = args.devices.split(',')
-        args.device_ids = [int(id_) for id_ in device_ids]
-        args.gpu = args.device_ids[0]
-
     print('Args in experiment:')
     print(args)
 
@@ -202,70 +219,72 @@ if __name__ == '__main__':
     Exp = Exp_Main
 
     if args.is_training:
-        try:
-            for ii in range(args.itr):
-                setting = 'seed{}_{}_{}_{}_{}_{}_{}_head_drop{}_drop{}_rr{}_hl{}_ql{}_tl{}_lr{}_norm_type{}_use_dynamic{}_use_tf{}_enc{}_itr{}'.format(
-                args.random_seed,
-                args.model,
-                args.model_id,
-                args.features,
-                args.d_model,
-                args.d_ff,
-                args.d_head,
-                args.head_dropout,
-                args.dropout,
-                args.reduction_ratio,
-                args.lambda_h_loss,
-                args.lambda_q_loss,
-                args.lambda_trend_loss,
-                args.learning_rate,
-                args.norm_type,
-                args.use_dynamic,
-                args.use_trend_forecast,
-                args.encoder_backbone,
-                ii
-                )
-
-                exp = Exp(args)  # set experiments
-                print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
-                exp.train(setting)
-
-                print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-                exp.test(setting)
-
-                if args.do_predict:
-                    print('>>>>>>>predicting : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-                    exp.predict(setting, True)
-
-                torch.cuda.empty_cache()
-        finally:
-            cleanup_distributed()
-    else:
-        try:
-            setting = 'seed{}_{}_{}_{}_{}_{}_{}_head_drop{}_drop{}_rr{}_hl{}_ql{}_tl{}_lr{}_norm_type{}_use_dynamic{}_use_tf{}_enc{}'.format(
-                args.random_seed,
-                args.model,
-                args.model_id,
-                args.features,
-                args.d_model,
-                args.d_ff,
-                args.d_head,
-                args.head_dropout,
-                args.dropout,
-                args.reduction_ratio,
-                args.lambda_h_loss,
-                args.lambda_q_loss,
-                args.lambda_trend_loss,
-                args.learning_rate,
-                args.norm_type,
-                args.use_dynamic,
-                args.use_trend_forecast,
-                args.encoder_backbone,
-                )
+        for ii in range(args.itr):
+            setting = 'seed{}_{}_{}_{}_{}_{}_{}_head_drop{}_drop{}_hl{}_ql{}_tl{}_tlm{}_ttm{}_rtm{}_tem{}_gc{}_lr{}_norm_type{}_use_tf{}_enc{}_kernels{}_itr{}'.format(
+            args.random_seed,
+            args.model,
+            args.model_id,
+            args.features,
+            args.d_model,
+            args.d_ff,
+            args.d_head,
+            args.head_dropout,
+            args.dropout,
+            args.lambda_h_loss,
+            args.lambda_q_loss,
+            args.lambda_trend_loss,
+            args.trend_loss_mode,
+            args.trend_target_mode,
+            args.residual_target_mode,
+            args.trend_extractor_mode,
+            args.grad_clip,
+            args.learning_rate,
+            args.norm_type,
+            args.use_trend_forecast,
+            args.encoder_backbone,
+            args.kernels,
+            ii
+            )
 
             exp = Exp(args)  # set experiments
+            print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
+            exp.train(setting)
+
             print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-            exp.test(setting, test=1)
+            exp.test(setting)
+
+            if args.do_predict:
+                print('>>>>>>>predicting : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+                exp.predict(setting, True)
+
             torch.cuda.empty_cache()
-        finally:
-            cleanup_distributed()
+    else:
+        setting = 'seed{}_{}_{}_{}_{}_{}_{}_head_drop{}_drop{}_hl{}_ql{}_tl{}_tlm{}_ttm{}_rtm{}_tem{}_gc{}_lr{}_norm_type{}_use_tf{}_enc{}_kernels{}'.format(
+            args.random_seed,
+            args.model,
+            args.model_id,
+            args.features,
+            args.d_model,
+            args.d_ff,
+            args.d_head,
+            args.head_dropout,
+            args.dropout,
+            args.lambda_h_loss,
+            args.lambda_q_loss,
+            args.lambda_trend_loss,
+            args.trend_loss_mode,
+            args.trend_target_mode,
+            args.residual_target_mode,
+            args.trend_extractor_mode,
+            args.grad_clip,
+            args.learning_rate,
+            args.norm_type,
+            args.use_trend_forecast,
+            args.encoder_backbone,
+            args.kernels
+            )
+
+        exp = Exp(args)  # set experiments
+        print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+        exp.test(setting, test=1)
+        torch.cuda.empty_cache()

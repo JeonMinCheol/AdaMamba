@@ -154,6 +154,23 @@ class AdaptiveNormalizationBlock(nn.Module):
     def extract_trend(self, x: torch.Tensor):
         return self.detrender.extract_trend(x)
 
+    def moving_average_trend(self, x: torch.Tensor, kernel_size: int | None = None):
+        if kernel_size is None:
+            if hasattr(self.detrender, "kernels") and len(self.detrender.kernels) > 0:
+                kernel_size = int(max(self.detrender.kernels))
+            else:
+                kernel_size = int(getattr(self, "seq_len", x.size(1)))
+
+        bsz, seq_len, n_vars = x.shape
+        pad_left = (kernel_size - 1) // 2
+        pad_right = (kernel_size - 1) - pad_left
+
+        x_tokens = x.permute(0, 2, 1).contiguous().reshape(bsz * n_vars, 1, seq_len)
+        x_padded = F.pad(x_tokens, (pad_left, pad_right), mode='replicate')
+        trend = F.avg_pool1d(x_padded, kernel_size=kernel_size, stride=1)
+        trend = trend.view(bsz, n_vars, seq_len).permute(0, 2, 1).contiguous()
+        return trend
+
     def detrend(self, x: torch.Tensor, trend: torch.Tensor = None):
         return self.detrender.detrend(x, trend=trend)
 
